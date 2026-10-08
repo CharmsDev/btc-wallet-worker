@@ -95,10 +95,6 @@ async fn mcp(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }
 }
 
-fn tool_failure(id: Value, message: &str) -> Result<Response> {
-    json_value(200, &mcp::rpc_error(id, -32603, message))
-}
-
 struct App<'a> {
     ctx: &'a RouteContext<()>,
     config: &'a Config,
