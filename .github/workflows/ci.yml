@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - name: Install the wasm C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang llvm pkg-config libssl-dev
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy for wasm32
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.8.7
+      - name: Build the worker
+        run: worker-build --release

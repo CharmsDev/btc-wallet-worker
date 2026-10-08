@@ -1,0 +1,7 @@
+/target
+/build
+/node_modules
+.dev.vars
+.wrangler
+*.wasm
+.DS_Store

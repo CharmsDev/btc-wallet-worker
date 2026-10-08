@@ -1,0 +1,40 @@
+name = "btc-wallet-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-08"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "worker-build --release"
+
+# Replace wallet.example.com with your hostname before `wrangler deploy`.
+# This custom domain is the only route. workers.dev and preview URLs stay off
+# so the hostname can sit behind Cloudflare Access.
+[[routes]]
+pattern = "wallet.example.com"
+custom_domain = true
+
+[vars]
+NETWORK = "mainnet"
+SCRIPT = "bip84"
+ACCOUNT = "0"
+GAP_LIMIT = "20"
+MAX_SCAN_INDEX = "200"
+MAX_CHAIN_CALLS = "80"
+FEE_TARGET_BLOCKS = "3"
+PER_TX_CAP_SATS = "100000"
+ROLLING_24H_CAP_SATS = "250000"
+MAX_FEERATE_SAT_VB = "200"
+MAX_FEE_SATS = "20000"
+ESPLORA_URLS = ""
+EXPECTED_FINGERPRINT = ""
+ACCESS_TEAM_DOMAIN = ""
+ACCESS_AUD = ""
+
+[[durable_objects.bindings]]
+name = "SPEND_GUARD"
+class_name = "SpendGuard"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SpendGuard"]

@@ -1,0 +1,6 @@
+# secp256k1-sys compiles its C library with clang when the target is wasm32.
+# gcc has no wasm32 backend. worker-build invokes cargo, which reads this env.
+[env]
+CC_wasm32_unknown_unknown = "clang"
+AR_wasm32_unknown_unknown = "llvm-ar"
+CFLAGS_wasm32_unknown_unknown = "--target=wasm32-unknown-unknown"
