@@ -11,6 +11,7 @@ use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 #[cfg(test)]
 use bitcoin::sighash::SighashCache;
+use bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bitcoin::transaction::Version;
 use bitcoin::{
     Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -415,6 +416,7 @@ pub fn annotate_owned_inputs(
 }
 
 pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt) -> Result<(), String> {
+    require_committing_sighash(psbt, wallet)?;
     let secp = Secp256k1::new();
     match psbt.sign(wallet.master_key(), &secp) {
         Ok(_) => {}
@@ -425,6 +427,46 @@ pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt) -> Result<(), String> {
         }
     }
     finalize_signed_inputs(psbt);
+    Ok(())
+}
+
+fn require_committing_sighash(psbt: &Psbt, wallet: &Wallet) -> Result<(), String> {
+    let fingerprint = wallet.fingerprint();
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        let ours = input
+            .bip32_derivation
+            .values()
+            .any(|(origin, _)| *origin == fingerprint)
+            || input
+                .tap_key_origins
+                .values()
+                .any(|(_, (origin, _))| *origin == fingerprint);
+        if !ours {
+            continue;
+        }
+        match wallet.script() {
+            ScriptKind::Bip84 => {
+                let sighash = input
+                    .ecdsa_hash_ty()
+                    .map_err(|_| format!("input {index} uses a sighash this wallet cannot sign"))?;
+                if sighash != EcdsaSighashType::All {
+                    return Err(format!(
+                        "input {index} sighash {sighash} is not allowed; only SIGHASH_ALL can be signed"
+                    ));
+                }
+            }
+            ScriptKind::Bip86 => {
+                let sighash = input
+                    .taproot_hash_ty()
+                    .map_err(|_| format!("input {index} uses a sighash this wallet cannot sign"))?;
+                if sighash != TapSighashType::Default && sighash != TapSighashType::All {
+                    return Err(format!(
+                        "input {index} sighash {sighash} is not allowed; only SIGHASH_DEFAULT and SIGHASH_ALL can be signed"
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -647,5 +689,54 @@ mod tests {
         assert!(inspection
             .dest
             .contains("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"));
+    }
+
+    #[test]
+    fn non_committing_sighash_is_rejected_before_a_signature_exists() {
+        let segwit = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&segwit, 0, 50_000);
+        let dest = segwit.derive(ChainKind::External, 1).unwrap().address;
+        let change = segwit.derive(ChainKind::Change, 0).unwrap().address;
+        for sighash in [
+            EcdsaSighashType::None,
+            EcdsaSighashType::Single,
+            EcdsaSighashType::AllPlusAnyoneCanPay,
+            EcdsaSighashType::NonePlusAnyoneCanPay,
+            EcdsaSighashType::SinglePlusAnyoneCanPay,
+        ] {
+            let mut psbt = pay(
+                &segwit,
+                std::slice::from_ref(&coin),
+                &dest,
+                &change,
+                20_000,
+                2,
+            )
+            .unwrap()
+            .psbt;
+            psbt.inputs[0].sighash_type = Some(sighash.into());
+            let err = sign_psbt(&segwit, &mut psbt).unwrap_err();
+            assert!(err.contains("not allowed"), "{err}");
+            assert!(psbt.inputs[0].partial_sigs.is_empty());
+        }
+
+        let tap = wallet(ScriptKind::Bip86);
+        let coin = coin_at(&tap, 0, 40_000);
+        let dest = tap.derive(ChainKind::External, 1).unwrap().address;
+        let change = tap.derive(ChainKind::Change, 0).unwrap().address;
+        let mut allowed = pay(&tap, std::slice::from_ref(&coin), &dest, &change, 10_000, 1)
+            .unwrap()
+            .psbt;
+        allowed.inputs[0].sighash_type = Some(TapSighashType::All.into());
+        sign_psbt(&tap, &mut allowed).unwrap();
+
+        let mut rejected = pay(&tap, std::slice::from_ref(&coin), &dest, &change, 10_000, 1)
+            .unwrap()
+            .psbt;
+        rejected.inputs[0].sighash_type = Some(TapSighashType::None.into());
+        assert!(sign_psbt(&tap, &mut rejected)
+            .unwrap_err()
+            .contains("not allowed"));
+        assert!(rejected.inputs[0].tap_key_sig.is_none());
     }
 }

@@ -139,7 +139,7 @@ The worker is a hot wallet. A stolen bearer token, a stolen Access service token
 
 Caps are applied inside one Durable Object, `SpendGuard`, so two overlapping requests cannot both pass a check that only one of them should pass. A reservation counts against the cap immediately. It expires after two minutes if the worker crashes before commit. Broadcasting a transaction that the network rejects releases that reservation. Returning a signed PSBT does not release it.
 
-`send` counts the payment plus the fee. `sign_psbt` counts the net sats leaving the wallet (inputs it owns, minus outputs that pay it). Addresses that are not for `NETWORK` are rejected.
+`send` counts the payment plus the fee. `sign_psbt` counts the net sats leaving the wallet (inputs it owns, minus outputs that pay it). It signs only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected. A broadcast that fails in transit keeps the reservation. The reservation is released only when a backend rejects the transaction and no backend shows that txid.
 
 The spend log stores txid, outflow, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped.
 

@@ -1,8 +1,10 @@
 use crate::auth::{verify_access_jwt, AccessRules, Clients};
 use crate::config::{Config, RawConfig};
 use crate::esplora::{
-    failover_status, form_encode, parse_address_stats, parse_api_key, parse_fee_estimates,
-    parse_history, parse_token_response, parse_utxos, pick_feerate, AddressStats, Utxo,
+    classify_attempt, fold_broadcast, fold_presence, form_encode, parse_address_stats,
+    parse_api_key, parse_fee_estimates, parse_history_page, parse_token_response, parse_utxos,
+    pick_feerate, release_after_broadcast, AddressStats, AttemptClass, BroadcastVerdict, Presence,
+    RawAttempt, Utxo,
 };
 use crate::guard::{
     merge_scan, take_receive, ApplyResult, Command, GuardOp, GuardReply, OauthCache, SpendIntent,
@@ -10,7 +12,7 @@ use crate::guard::{
 };
 use crate::mcp::{self, Incoming, ToolCall};
 use crate::policy::SpendPolicy;
-use crate::scan::{next_probe, ProbeStep, ScanCache};
+use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
     annotate_owned_inputs, build_payment, extract_signed, inspect_psbt, psbt_from_base64,
     psbt_to_base64, sign_psbt, Coin, Payment,
@@ -219,41 +221,59 @@ impl App<'_> {
     async fn history(&mut self, limit: u32) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let (cache, _, _) = self.discover(&wallet).await?;
-        let mut addresses = Vec::new();
-        for index in cache.used_external.iter().rev().take(8) {
-            addresses.push(
-                wallet
-                    .derive(ChainKind::External, *index)?
-                    .address
-                    .to_string(),
-            );
-        }
-        for index in cache.used_change.iter().rev().take(4) {
-            addresses.push(
-                wallet
-                    .derive(ChainKind::Change, *index)?
-                    .address
-                    .to_string(),
-            );
+        let targets = history_indexes(&cache.used_external, &cache.used_change);
+        let mut ours = Vec::with_capacity(targets.len());
+        for (chain, index) in &targets {
+            let kind = match chain {
+                0 => ChainKind::External,
+                1 => ChainKind::Change,
+                _ => return Err("history index chain is invalid".into()),
+            };
+            ours.push(wallet.derive(kind, *index)?.address.to_string());
         }
         let mut seen = BTreeSet::new();
         let mut rows = Vec::new();
-        for address in &addresses {
-            let body = self.esplora_get(&format!("/address/{address}/txs")).await?;
-            for tx in parse_history(&body, &addresses)? {
-                if seen.insert(tx.txid.clone()) {
-                    rows.push(json!({
-                        "txid": tx.txid,
-                        "confirmed": tx.confirmed,
-                        "block_height": tx.block_height,
-                        "fee_sats": tx.fee_sats,
-                        "net_sats": tx.net_sats,
-                    }));
+        for address in &ours {
+            let mut path = format!("/address/{address}/txs");
+            loop {
+                let body = self.esplora_get(&path).await?;
+                let page = parse_history_page(&body, &ours)?;
+                for tx in page.txs {
+                    if seen.insert(tx.txid.clone()) {
+                        rows.push(tx);
+                    }
                 }
+                let Some(cursor) = page.next_confirmed else {
+                    break;
+                };
+                if rows.len() >= limit as usize {
+                    break;
+                }
+                path = format!("/address/{address}/txs/chain/{cursor}");
             }
         }
+        rows.sort_by(|left, right| match (left.confirmed, right.confirmed) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            _ => right
+                .block_height
+                .unwrap_or(0)
+                .cmp(&left.block_height.unwrap_or(0)),
+        });
         rows.truncate(limit as usize);
-        Ok(json!({ "transactions": rows }))
+        let transactions: Vec<Value> = rows
+            .iter()
+            .map(|tx| {
+                json!({
+                    "txid": tx.txid,
+                    "confirmed": tx.confirmed,
+                    "block_height": tx.block_height,
+                    "fee_sats": tx.fee_sats,
+                    "net_sats": tx.net_sats,
+                })
+            })
+            .collect();
+        Ok(json!({ "transactions": transactions }))
     }
 
     async fn fee_estimates(&mut self) -> Result<Value, String> {
@@ -366,10 +386,7 @@ impl App<'_> {
             self.abort(id).await;
             return Err(err);
         }
-        if let Err(err) = self.esplora_post("/tx", hex, "text/plain").await {
-            self.release(id).await;
-            return Err(err);
-        }
+        self.finish_broadcast(id, &txid, &hex).await?;
         Ok(json!({
             "broadcast": true,
             "signed": true,
@@ -445,10 +462,7 @@ impl App<'_> {
                     return Err(err);
                 }
             };
-            if let Err(err) = self.esplora_post("/tx", hex, "text/plain").await {
-                self.release(id).await;
-                return Err(err);
-            }
+            self.finish_broadcast(id, &txid, &hex).await?;
         }
         Ok(json!({
             "broadcast": broadcast,
@@ -692,13 +706,100 @@ impl App<'_> {
         self.esplora(false, path, None, "application/json").await
     }
 
-    async fn esplora_post(
-        &mut self,
-        path: &str,
-        body: String,
-        content_type: &str,
-    ) -> Result<String, String> {
-        self.esplora(true, path, Some(body), content_type).await
+    async fn finish_broadcast(&mut self, id: u64, txid: &str, hex: &str) -> Result<(), String> {
+        let verdict = self.post_broadcast(hex).await;
+        let seen = if release_after_broadcast(&verdict, Some(false)) {
+            self.txid_known(txid).await
+        } else {
+            None
+        };
+        if release_after_broadcast(&verdict, seen) {
+            self.release(id).await;
+            let detail = match &verdict {
+                BroadcastVerdict::Rejected { detail } => detail.clone(),
+                BroadcastVerdict::Accepted | BroadcastVerdict::Unknown { .. } => {
+                    "broadcast was rejected".to_string()
+                }
+            };
+            return Err(format!("broadcast rejected: {detail}"));
+        }
+        match verdict {
+            BroadcastVerdict::Accepted => Ok(()),
+            BroadcastVerdict::Rejected { .. } if seen == Some(true) => Ok(()),
+            BroadcastVerdict::Rejected { .. } => {
+                Err("broadcast outcome is unclear; the spend stays reserved".into())
+            }
+            BroadcastVerdict::Unknown { detail } => {
+                Err(format!("{detail}; the spend stays reserved"))
+            }
+        }
+    }
+
+    async fn post_broadcast(&mut self, body: &str) -> BroadcastVerdict {
+        let mut attempts = Vec::new();
+        for backend in self.config.backends.clone() {
+            let bearer = if backend.oauth {
+                match self.oauth_token().await {
+                    Ok(token) => Some(token),
+                    Err(err) => {
+                        attempts.push(RawAttempt::Transport { message: err });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let url = format!("{}/tx", backend.base.trim_end_matches('/'));
+            match self
+                .http(
+                    true,
+                    &url,
+                    Some(body.to_string()),
+                    "text/plain",
+                    bearer.as_deref(),
+                )
+                .await
+            {
+                Ok((status, text)) => attempts.push(RawAttempt::Http { status, body: text }),
+                Err(err) => attempts.push(RawAttempt::Transport { message: err }),
+            }
+            if !matches!(fold_broadcast(&attempts), BroadcastVerdict::Unknown { .. }) {
+                break;
+            }
+        }
+        fold_broadcast(&attempts)
+    }
+
+    async fn txid_known(&mut self, txid: &str) -> Option<bool> {
+        let mut probes = Vec::new();
+        for backend in self.config.backends.clone() {
+            let bearer = if backend.oauth {
+                match self.oauth_token().await {
+                    Ok(token) => Some(token),
+                    Err(_) => {
+                        probes.push(Presence::Unclear);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let url = format!("{}/tx/{txid}", backend.base.trim_end_matches('/'));
+            let probe = match self
+                .http(false, &url, None, "application/json", bearer.as_deref())
+                .await
+            {
+                Ok((status, _)) if (200..300).contains(&status) => Presence::Found,
+                Ok((404, _)) => Presence::Missing,
+                Ok(_) => Presence::Unclear,
+                Err(_) => Presence::Unclear,
+            };
+            probes.push(probe);
+            if probe == Presence::Found {
+                break;
+            }
+        }
+        fold_presence(&probes)
     }
 
     async fn esplora(
@@ -714,26 +815,30 @@ impl App<'_> {
             let bearer = if backend.oauth {
                 match self.oauth_token().await {
                     Ok(token) => Some(token),
-                    Err(_) => continue,
+                    Err(err) => {
+                        last = err;
+                        continue;
+                    }
                 }
             } else {
                 None
             };
             let url = format!("{}{path}", backend.base.trim_end_matches('/'));
-            let (status, text) = self
+            let (status, text) = match self
                 .http(post, &url, body.clone(), content_type, bearer.as_deref())
-                .await?;
-            if (200..300).contains(&status) {
-                return Ok(text);
+                .await
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    last = err;
+                    continue;
+                }
+            };
+            match classify_attempt(false, status, &text) {
+                AttemptClass::Success => return Ok(text),
+                AttemptClass::Continue { note } => last = note,
+                AttemptClass::Rejected { detail, .. } => return Err(detail),
             }
-            if post && path == "/tx" && !failover_status(status) {
-                let snippet: String = text.chars().take(180).collect();
-                return Err(format!("broadcast rejected ({status}): {snippet}"));
-            }
-            if !failover_status(status) {
-                return Err(format!("esplora returned {status}"));
-            }
-            last = format!("esplora returned {status}");
         }
         Err(last)
     }

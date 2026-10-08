@@ -62,6 +62,17 @@ pub fn merge_used(existing: &[u32], observed: &[u32]) -> Vec<u32> {
     out
 }
 
+pub fn history_indexes(external: &[u32], change: &[u32]) -> Vec<(u8, u32)> {
+    let mut out = Vec::with_capacity(external.len() + change.len());
+    for index in external {
+        out.push((0, *index));
+    }
+    for index in change {
+        out.push((1, *index));
+    }
+    out
+}
+
 pub fn next_unused(used: &[u32], start: u32) -> u32 {
     let mut index = start;
     while used.binary_search(&index).is_ok() {
@@ -119,6 +130,17 @@ mod tests {
         );
         probed.insert(2, false);
         let _ = probed;
+    }
+
+    #[test]
+    fn history_includes_every_used_index() {
+        let external: Vec<u32> = (0..12).collect();
+        let change: Vec<u32> = (0..6).collect();
+        let indexes = history_indexes(&external, &change);
+        assert_eq!(indexes.len(), 18);
+        assert!(indexes.contains(&(0, 0)));
+        assert!(indexes.contains(&(0, 11)));
+        assert!(indexes.contains(&(1, 5)));
     }
 
     #[test]

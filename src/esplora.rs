@@ -24,7 +24,7 @@ pub fn plan_backends(
             .into_iter()
             .map(|url| {
                 let base = url.trim_end_matches('/').to_string();
-                let oauth = have_key && base.contains("enterprise.blockstream.info");
+                let oauth = have_key && blockstream_enterprise_origin(&base);
                 Backend { base, oauth }
             })
             .collect());
@@ -71,6 +71,29 @@ fn oauth(base: &str) -> Backend {
         base: base.to_string(),
         oauth: true,
     }
+}
+
+pub fn blockstream_enterprise_origin(url: &str) -> bool {
+    let Some(rest) = url
+        .get(8..)
+        .filter(|_| url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://"))
+    else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return false;
+    }
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = match hostport.rsplit_once(':') {
+        Some((name, port)) if !name.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => hostport,
+    };
+    host.eq_ignore_ascii_case("enterprise.blockstream.info")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,10 +176,20 @@ pub struct HistoryTx {
     pub net_sats: i64,
 }
 
-pub fn parse_history(body: &str, ours: &[String]) -> Result<Vec<HistoryTx>, String> {
+pub const CONFIRMED_PAGE: usize = 25;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub txs: Vec<HistoryTx>,
+    pub next_confirmed: Option<String>,
+}
+
+pub fn parse_history_page(body: &str, ours: &[String]) -> Result<HistoryPage, String> {
     let rows: Vec<Value> =
         serde_json::from_str(body).map_err(|_| "history response was not esplora json")?;
     let mut out = Vec::new();
+    let mut confirmed_count = 0usize;
+    let mut last_confirmed = None;
     for row in rows {
         let txid = row
             .get("txid")
@@ -174,6 +207,10 @@ pub fn parse_history(body: &str, ours: &[String]) -> Result<Vec<HistoryTx>, Stri
         let block_height = status
             .and_then(|status| status.get("block_height"))
             .and_then(Value::as_u64);
+        if confirmed {
+            confirmed_count += 1;
+            last_confirmed = Some(txid.clone());
+        }
         let fee_sats = row.get("fee").and_then(Value::as_u64);
         let mut net_sats = 0i64;
         if let Some(vins) = row.get("vin").and_then(Value::as_array) {
@@ -207,7 +244,15 @@ pub fn parse_history(body: &str, ours: &[String]) -> Result<Vec<HistoryTx>, Stri
             net_sats,
         });
     }
-    Ok(out)
+    let next_confirmed = if confirmed_count >= CONFIRMED_PAGE {
+        last_confirmed
+    } else {
+        None
+    };
+    Ok(HistoryPage {
+        txs: out,
+        next_confirmed,
+    })
 }
 
 pub fn parse_fee_estimates(body: &str) -> Result<BTreeMap<u32, f64>, String> {
@@ -313,6 +358,116 @@ pub fn failover_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 404 | 408 | 429 | 500 | 502 | 503 | 504)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttemptClass {
+    Success,
+    Continue { note: String },
+    Rejected { status: u16, detail: String },
+}
+
+pub fn classify_attempt(broadcast: bool, status: u16, body: &str) -> AttemptClass {
+    if (200..300).contains(&status) {
+        return AttemptClass::Success;
+    }
+    if broadcast && status == 400 {
+        let detail: String = body.chars().take(180).collect();
+        let trimmed = detail.trim();
+        if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("<html") {
+            return AttemptClass::Continue {
+                note: format!("esplora returned {status}"),
+            };
+        }
+        if already_accepted_broadcast(trimmed) {
+            return AttemptClass::Success;
+        }
+        return AttemptClass::Rejected {
+            status,
+            detail: trimmed.to_string(),
+        };
+    }
+    if failover_status(status) {
+        return AttemptClass::Continue {
+            note: format!("esplora returned {status}"),
+        };
+    }
+    AttemptClass::Rejected {
+        status,
+        detail: format!("esplora returned {status}"),
+    }
+}
+
+fn already_accepted_broadcast(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("txn-already") || lower.contains("already in") || lower.contains("already known")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BroadcastVerdict {
+    Accepted,
+    Rejected { detail: String },
+    Unknown { detail: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawAttempt {
+    Transport { message: String },
+    Http { status: u16, body: String },
+}
+
+pub fn fold_broadcast(attempts: &[RawAttempt]) -> BroadcastVerdict {
+    let mut indeterminate = false;
+    let mut last = "all esplora backends failed".to_string();
+    for attempt in attempts {
+        match attempt {
+            RawAttempt::Transport { message } => {
+                indeterminate = true;
+                last = message.clone();
+            }
+            RawAttempt::Http { status, body } => match classify_attempt(true, *status, body) {
+                AttemptClass::Success => return BroadcastVerdict::Accepted,
+                AttemptClass::Continue { note } => {
+                    if failover_status(*status) || *status >= 500 {
+                        indeterminate = true;
+                    }
+                    last = note;
+                }
+                AttemptClass::Rejected { detail, .. } => {
+                    if indeterminate {
+                        last = detail;
+                    } else {
+                        return BroadcastVerdict::Rejected { detail };
+                    }
+                }
+            },
+        }
+    }
+    BroadcastVerdict::Unknown { detail: last }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Found,
+    Missing,
+    Unclear,
+}
+
+pub fn fold_presence(probes: &[Presence]) -> Option<bool> {
+    if probes.contains(&Presence::Found) {
+        return Some(true);
+    }
+    if !probes.is_empty() && probes.iter().all(|probe| *probe == Presence::Missing) {
+        return Some(false);
+    }
+    None
+}
+
+pub fn release_after_broadcast(verdict: &BroadcastVerdict, seen: Option<bool>) -> bool {
+    match verdict {
+        BroadcastVerdict::Accepted | BroadcastVerdict::Unknown { .. } => false,
+        BroadcastVerdict::Rejected { .. } => seen == Some(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,14 +537,14 @@ mod tests {
         assert!(utxos[0].confirmed);
 
         let ours = vec!["bc1qours".to_string()];
-        let history = parse_history(
+        let history = parse_history_page(
             r#"[{"txid":"bb","fee":120,"status":{"confirmed":false},"vin":[{"prevout":{"scriptpubkey_address":"bc1qours","value":2000}}],"vout":[{"scriptpubkey_address":"bc1qother","value":1800}]}]"#,
             &ours,
         )
         .unwrap();
-        assert_eq!(history[0].net_sats, -2000);
-        assert_eq!(history[0].fee_sats, Some(120));
-        assert!(!history[0].confirmed);
+        assert_eq!(history.txs[0].net_sats, -2000);
+        assert_eq!(history.txs[0].fee_sats, Some(120));
+        assert!(!history.txs[0].confirmed);
 
         let estimates = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
         assert_eq!(pick_feerate(&estimates, 3).unwrap(), 6);
@@ -418,5 +573,106 @@ mod tests {
         );
         assert!(failover_status(429));
         assert!(!failover_status(400));
+    }
+
+    #[test]
+    fn oauth_is_only_the_enterprise_https_host() {
+        assert!(blockstream_enterprise_origin(
+            "https://enterprise.blockstream.info/api"
+        ));
+        assert!(blockstream_enterprise_origin(
+            "https://enterprise.blockstream.info:443/testnet/api"
+        ));
+        assert!(!blockstream_enterprise_origin(
+            "https://enterprise.blockstream.info.attacker.example/api"
+        ));
+        assert!(!blockstream_enterprise_origin(
+            "http://enterprise.blockstream.info/api"
+        ));
+        assert!(!blockstream_enterprise_origin(
+            "https://attacker.example/enterprise.blockstream.info"
+        ));
+        let custom = plan_backends(
+            NetworkKind::Mainnet,
+            "https://enterprise.blockstream.info.attacker.example/api, https://enterprise.blockstream.info/api",
+            true,
+        )
+        .unwrap();
+        assert!(!custom[0].oauth);
+        assert!(custom[1].oauth);
+    }
+
+    #[test]
+    fn history_keeps_change_inside_the_wallet_and_pages_confirmed_txs() {
+        let ours = vec!["bc1qrecv".to_string(), "bc1qchange".to_string()];
+        let body = r#"[{"txid":"cc","fee":200,"status":{"confirmed":true,"block_height":10},"vin":[{"prevout":{"scriptpubkey_address":"bc1qrecv","value":5000}}],"vout":[{"scriptpubkey_address":"bc1qother","value":1000},{"scriptpubkey_address":"bc1qchange","value":3800}]}]"#;
+        let page = parse_history_page(body, &ours).unwrap();
+        assert_eq!(page.txs[0].net_sats, -1200);
+        assert!(page.next_confirmed.is_none());
+        let mut rows = Vec::new();
+        for index in 0..25 {
+            rows.push(format!(
+                r#"{{"txid":"{index:02x}","status":{{"confirmed":true,"block_height":1}}}}"#
+            ));
+        }
+        let full = format!("[{}]", rows.join(","));
+        let page = parse_history_page(&full, &[]).unwrap();
+        assert_eq!(page.next_confirmed.as_deref(), Some("18"));
+    }
+
+    #[test]
+    fn transport_errors_fall_through_and_only_a_clean_reject_releases() {
+        let verdict = fold_broadcast(&[
+            RawAttempt::Transport {
+                message: "chain request failed".into(),
+            },
+            RawAttempt::Http {
+                status: 200,
+                body: "txid".into(),
+            },
+        ]);
+        assert_eq!(verdict, BroadcastVerdict::Accepted);
+
+        let verdict = fold_broadcast(&[
+            RawAttempt::Transport {
+                message: "chain response was not text".into(),
+            },
+            RawAttempt::Http {
+                status: 502,
+                body: String::new(),
+            },
+        ]);
+        assert!(matches!(verdict, BroadcastVerdict::Unknown { .. }));
+        assert!(!release_after_broadcast(&verdict, Some(false)));
+
+        let verdict = fold_broadcast(&[RawAttempt::Http {
+            status: 400,
+            body: "sendrawtransaction RPC error: bad-txns-inputs-missingorspent".into(),
+        }]);
+        assert!(matches!(verdict, BroadcastVerdict::Rejected { .. }));
+        assert!(release_after_broadcast(&verdict, Some(false)));
+        assert!(!release_after_broadcast(&verdict, Some(true)));
+        assert!(!release_after_broadcast(&verdict, None));
+
+        let verdict = fold_broadcast(&[
+            RawAttempt::Transport {
+                message: "chain request failed".into(),
+            },
+            RawAttempt::Http {
+                status: 400,
+                body: "bad-txns-inputs-missingorspent".into(),
+            },
+        ]);
+        assert!(matches!(verdict, BroadcastVerdict::Unknown { .. }));
+
+        assert_eq!(fold_presence(&[Presence::Missing, Presence::Unclear]), None);
+        assert_eq!(
+            fold_presence(&[Presence::Missing, Presence::Missing]),
+            Some(false)
+        );
+        assert_eq!(
+            fold_presence(&[Presence::Missing, Presence::Found]),
+            Some(true)
+        );
     }
 }
