@@ -6,17 +6,17 @@ use crate::esplora::{
     AddressStats, AttemptClass, BroadcastVerdict, RawAttempt, Utxo,
 };
 use crate::guard::{
-    merge_scan, take_receive, GuardOp, GuardReply, OauthCache, SpendKind, SpendRecord,
+    attach_log_warning, join_log_warning, merge_scan, take_receive, unlogged_spend_warning,
+    GuardOp, GuardReply, OauthCache, SpendKind, SpendRecord,
 };
 use crate::mcp::{self, Incoming, ToolCall};
 use crate::policy::enforce_input_cap;
 use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
-    annotate_owned_inputs, build_payment, extract_signed, inspect_psbt, psbt_from_base64,
-    psbt_to_base64, sign_psbt, transaction_input_sats, Coin, Payment,
+    annotate_owned_inputs, build_payment, extract_signed, indexes_from_origins, inspect_psbt,
+    psbt_from_base64, psbt_to_base64, sign_psbt, transaction_input_sats, Coin, Payment,
 };
 use crate::wallet::{parse_address, ChainKind, Wallet};
-use bitcoin::bip32::{ChildNumber, DerivationPath};
 use bitcoin::psbt::Psbt;
 use bitcoin::ScriptBuf;
 use serde_json::{json, Value};
@@ -187,9 +187,19 @@ impl App<'_> {
     async fn address(&mut self, advance: bool) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let _ = self.discover(&wallet).await?;
-        let reply = guard_call(self.ctx, &GuardOp::AllocateReceive { advance }).await?;
-        let GuardReply::ReceiveIndex { index } = reply else {
-            return Err("spend guard did not allocate an address".into());
+        let reply = guard_call(
+            self.ctx,
+            &GuardOp::AllocateReceive {
+                advance,
+                max_index: self.config.max_scan_index,
+                gap: self.config.gap_limit,
+            },
+        )
+        .await?;
+        let index = match reply {
+            GuardReply::ReceiveIndex { index } => index,
+            GuardReply::Error { message } => return Err(message),
+            _ => return Err("spend guard did not allocate an address".into()),
         };
         let derived = wallet.derive(ChainKind::External, index)?;
         Ok(json!({
@@ -322,6 +332,7 @@ impl App<'_> {
             amount: sats,
             feerate,
             change: &change,
+            max_input_sats: self.config.max_tx_input_sats,
         })?;
         let input_sats = transaction_input_sats(&built.psbt)?;
         enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
@@ -341,27 +352,33 @@ impl App<'_> {
         let mut psbt = built.psbt;
         sign_psbt(&wallet, &mut psbt, self.config.max_tx_input_sats)?;
         let (txid, hex) = extract_signed(&psbt)?;
-        self.record_spend(
-            &txid,
-            input_sats,
-            &dest.to_string(),
-            built.fee_sats,
-            SpendKind::Send,
-            request_id,
-        )
-        .await;
-        self.broadcast_hex(&hex).await?;
-        Ok(json!({
-            "broadcast": true,
-            "signed": true,
-            "txid": txid,
-            "input_sats": input_sats,
-            "fee_sats": built.fee_sats,
-            "feerate_sat_vb": built.feerate_sat_vb,
-            "vsize": built.vsize,
-            "outputs": built.outputs,
-            "used_unconfirmed": built.used_unconfirmed,
-        }))
+        let warning = self
+            .record_spend(
+                &txid,
+                input_sats,
+                &dest.to_string(),
+                built.fee_sats,
+                SpendKind::Send,
+                request_id,
+            )
+            .await;
+        if let Err(err) = self.broadcast_hex(&hex).await {
+            return Err(join_log_warning(&err, warning));
+        }
+        Ok(attach_log_warning(
+            json!({
+                "broadcast": true,
+                "signed": true,
+                "txid": txid,
+                "input_sats": input_sats,
+                "fee_sats": built.fee_sats,
+                "feerate_sat_vb": built.feerate_sat_vb,
+                "vsize": built.vsize,
+                "outputs": built.outputs,
+                "used_unconfirmed": built.used_unconfirmed,
+            }),
+            warning,
+        ))
     }
 
     async fn sign_psbt(
@@ -386,32 +403,38 @@ impl App<'_> {
         )?;
         sign_psbt(&wallet, &mut psbt, self.config.max_tx_input_sats)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
-        self.record_spend(
-            &txid,
-            input_sats,
-            &inspection.dest,
-            inspection.fee_sats,
-            SpendKind::Sign,
-            request_id,
-        )
-        .await;
+        let warning = self
+            .record_spend(
+                &txid,
+                input_sats,
+                &inspection.dest,
+                inspection.fee_sats,
+                SpendKind::Sign,
+                request_id,
+            )
+            .await;
         if broadcast {
             if !inspection.broadcastable_after_sign {
-                return Err("psbt is not fully signed".into());
+                return Err(join_log_warning("psbt is not fully signed", warning));
             }
             let (_, hex) = extract_signed(&psbt)?;
-            self.broadcast_hex(&hex).await?;
+            if let Err(err) = self.broadcast_hex(&hex).await {
+                return Err(join_log_warning(&err, warning));
+            }
         }
-        Ok(json!({
-            "broadcast": broadcast,
-            "signed": true,
-            "txid": txid,
-            "input_sats": input_sats,
-            "fee_sats": inspection.fee_sats,
-            "vsize": inspection.vsize,
-            "dest": inspection.dest,
-            "psbt": psbt_to_base64(&psbt),
-        }))
+        Ok(attach_log_warning(
+            json!({
+                "broadcast": broadcast,
+                "signed": true,
+                "txid": txid,
+                "input_sats": input_sats,
+                "fee_sats": inspection.fee_sats,
+                "vsize": inspection.vsize,
+                "dest": inspection.dest,
+                "psbt": psbt_to_base64(&psbt),
+            }),
+            warning,
+        ))
     }
 
     async fn discover(
@@ -426,11 +449,17 @@ impl App<'_> {
         String,
     > {
         let cache = self.scan_cache().await?;
+        let issued_external = cache.receive_cursor;
         let (external, ext_stats) = self
-            .probe(wallet, ChainKind::External, &cache.used_external)
+            .probe(
+                wallet,
+                ChainKind::External,
+                &cache.used_external,
+                issued_external,
+            )
             .await?;
         let (change, chg_stats) = self
-            .probe(wallet, ChainKind::Change, &cache.used_change)
+            .probe(wallet, ChainKind::Change, &cache.used_change, 0)
             .await?;
         let reply = guard_call(
             self.ctx,
@@ -451,6 +480,7 @@ impl App<'_> {
         wallet: &Wallet,
         chain: ChainKind,
         used: &[u32],
+        issued_until: u32,
     ) -> Result<(Vec<u32>, BTreeMap<u32, AddressStats>), String> {
         let mut probed = BTreeMap::new();
         let mut stats = BTreeMap::new();
@@ -461,6 +491,7 @@ impl App<'_> {
                 self.config.gap_limit,
                 self.config.max_scan_index,
                 &probed,
+                issued_until,
             ) {
                 ProbeStep::Done => return Ok((newly, stats)),
                 ProbeStep::Exceeded { index } => {
@@ -545,7 +576,7 @@ impl App<'_> {
         fee_sats: u64,
         kind: SpendKind,
         _request_id: Option<String>,
-    ) {
+    ) -> Option<String> {
         let record = SpendRecord {
             txid: txid.to_string(),
             input_sats,
@@ -555,7 +586,23 @@ impl App<'_> {
             client: self.client.clone(),
             kind,
         };
-        let _ = guard_call(self.ctx, &GuardOp::AppendSpend { record }).await;
+        let mut detail = "spend guard unavailable".to_string();
+        for _ in 0..2 {
+            match guard_call(
+                self.ctx,
+                &GuardOp::AppendSpend {
+                    record: record.clone(),
+                },
+            )
+            .await
+            {
+                Ok(GuardReply::Appended) => return None,
+                Ok(GuardReply::Error { message }) => detail = message,
+                Err(message) => detail = message,
+                Ok(_) => detail = "spend guard returned an unexpected payload".into(),
+            }
+        }
+        Some(unlogged_spend_warning(&detail))
     }
 
     async fn broadcast_hex(&mut self, hex: &str) -> Result<(), String> {
@@ -788,15 +835,8 @@ fn owned_scripts(
     for index in 0..=extent(&cache.used_change).min(max_index) {
         indexes.entry(ChainKind::Change).or_default().insert(index);
     }
-    for input in &psbt.inputs {
-        for (fingerprint, path) in input.bip32_derivation.values() {
-            if *fingerprint != wallet.fingerprint() {
-                continue;
-            }
-            if let Some((chain, index)) = path_index(wallet, path) {
-                indexes.entry(chain).or_default().insert(index);
-            }
-        }
+    for (chain, index) in indexes_from_origins(wallet, psbt) {
+        indexes.entry(chain).or_default().insert(index);
     }
     let mut owned = BTreeMap::new();
     for (chain, set) in indexes {
@@ -806,42 +846,6 @@ fn owned_scripts(
         }
     }
     Ok(owned)
-}
-
-fn path_index(wallet: &Wallet, path: &DerivationPath) -> Option<(ChainKind, u32)> {
-    let parts: Vec<ChildNumber> = path.into_iter().copied().collect();
-    if parts.len() != 5 {
-        return None;
-    }
-    let purpose = hardened(&parts[0])?;
-    let coin = hardened(&parts[1])?;
-    let account = hardened(&parts[2])?;
-    if purpose != wallet.script().purpose() || coin != wallet.network().coin_type() {
-        return None;
-    }
-    if account != wallet.account() {
-        return None;
-    }
-    let chain = match normal(&parts[3])? {
-        0 => ChainKind::External,
-        1 => ChainKind::Change,
-        _ => return None,
-    };
-    Some((chain, normal(&parts[4])?))
-}
-
-fn hardened(child: &ChildNumber) -> Option<u32> {
-    match *child {
-        ChildNumber::Hardened { index } => Some(index),
-        ChildNumber::Normal { .. } => None,
-    }
-}
-
-fn normal(child: &ChildNumber) -> Option<u32> {
-    match *child {
-        ChildNumber::Normal { index } => Some(index),
-        ChildNumber::Hardened { .. } => None,
-    }
 }
 
 fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
@@ -1035,7 +1039,11 @@ impl DurableObject for SpendGuard {
                 used_external,
                 used_change,
             } => self.merge(used_external, used_change).await?,
-            GuardOp::AllocateReceive { advance } => self.allocate(advance).await?,
+            GuardOp::AllocateReceive {
+                advance,
+                max_index,
+                gap,
+            } => self.allocate(advance, max_index, gap).await?,
             GuardOp::GetOauth => match self.oauth().await? {
                 Some(cache) => GuardReply::Oauth {
                     access_token: cache.access_token,
@@ -1111,24 +1119,31 @@ impl SpendGuard {
         Ok(GuardReply::Scan { cache })
     }
 
-    async fn allocate(&self, advance: bool) -> Result<GuardReply> {
+    async fn allocate(&self, advance: bool, max_index: u32, gap: u32) -> Result<GuardReply> {
         let slot = Rc::new(RefCell::new(None));
         let slot_write = slot.clone();
         self.state
             .storage()
             .transaction(move |tx| async move {
                 let mut cache: ScanCache = load_or_default(&tx, "scan").await?;
-                let index = take_receive(&mut cache, advance);
-                tx.put("scan", &cache).await?;
-                *slot_write.borrow_mut() = Some(index);
+                match take_receive(&mut cache, advance, max_index, gap) {
+                    Ok(index) => {
+                        tx.put("scan", &cache).await?;
+                        *slot_write.borrow_mut() = Some(Ok(index));
+                    }
+                    Err(message) => {
+                        *slot_write.borrow_mut() = Some(Err(message));
+                    }
+                }
                 Ok(())
             })
             .await?;
-        let index = slot
-            .borrow_mut()
-            .take()
-            .ok_or_else(|| worker::Error::from("address allocation failed".to_string()))?;
-        Ok(GuardReply::ReceiveIndex { index })
+        let outcome = slot.borrow_mut().take();
+        match outcome {
+            Some(Ok(index)) => Ok(GuardReply::ReceiveIndex { index }),
+            Some(Err(message)) => Ok(GuardReply::Error { message }),
+            None => Err(worker::Error::from("address allocation failed".to_string())),
+        }
     }
 
     async fn scan(&self) -> Result<ScanCache> {

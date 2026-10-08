@@ -20,6 +20,7 @@ pub fn next_probe(
     gap: u32,
     max_index: u32,
     probed: &BTreeMap<u32, bool>,
+    issued_until: u32,
 ) -> ProbeStep {
     if gap == 0 {
         return ProbeStep::Exceeded { index: 0 };
@@ -28,12 +29,17 @@ pub fn next_probe(
     let mut index = 0u32;
     loop {
         let used_here = used.binary_search(&index).is_ok() || probed.get(&index) == Some(&true);
+        let issued = index < issued_until;
         if used_here {
             streak = 0;
         } else if let Some(false) = probed.get(&index) {
-            streak = streak.saturating_add(1);
-            if streak >= gap {
-                return ProbeStep::Done;
+            if issued {
+                streak = 0;
+            } else {
+                streak = streak.saturating_add(1);
+                if streak >= gap {
+                    return ProbeStep::Done;
+                }
             }
         } else if index > max_index {
             return ProbeStep::Exceeded { index };
@@ -84,12 +90,22 @@ pub fn next_unused(used: &[u32], start: u32) -> u32 {
     index
 }
 
-pub fn allocate_receive(cache: &mut ScanCache, advance: bool) -> u32 {
+pub fn allocate_receive(
+    cache: &mut ScanCache,
+    advance: bool,
+    max_index: u32,
+    gap: u32,
+) -> Result<u32, String> {
     let index = next_unused(&cache.used_external, cache.receive_cursor);
+    if index > max_index || index.saturating_add(gap) > max_index {
+        return Err(format!(
+            "receive index {index} would scan past MAX_SCAN_INDEX {max_index}"
+        ));
+    }
     if advance {
         cache.receive_cursor = index.saturating_add(1);
     }
-    index
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -100,11 +116,11 @@ mod tests {
     fn gap_scan_stops_after_consecutive_unused_indexes() {
         let used = vec![0];
         let mut probed = BTreeMap::new();
-        assert_eq!(next_probe(&used, 2, 20, &probed), ProbeStep::Probe(1));
+        assert_eq!(next_probe(&used, 2, 20, &probed, 0), ProbeStep::Probe(1));
         probed.insert(1, false);
-        assert_eq!(next_probe(&used, 2, 20, &probed), ProbeStep::Probe(2));
+        assert_eq!(next_probe(&used, 2, 20, &probed, 0), ProbeStep::Probe(2));
         probed.insert(2, false);
-        assert_eq!(next_probe(&used, 2, 20, &probed), ProbeStep::Done);
+        assert_eq!(next_probe(&used, 2, 20, &probed, 0), ProbeStep::Done);
     }
 
     #[test]
@@ -113,19 +129,22 @@ mod tests {
         let mut probed = BTreeMap::new();
         probed.insert(0, false);
         probed.insert(1, true);
-        assert_eq!(next_probe(&used, 2, 20, &probed), ProbeStep::Probe(2));
+        assert_eq!(next_probe(&used, 2, 20, &probed, 0), ProbeStep::Probe(2));
         probed.insert(2, false);
         probed.insert(3, false);
-        assert_eq!(next_probe(&used, 2, 20, &probed), ProbeStep::Done);
+        assert_eq!(next_probe(&used, 2, 20, &probed, 0), ProbeStep::Done);
         assert_eq!(merge_used(&[], &[1]), vec![1]);
     }
 
     #[test]
     fn scan_refuses_to_pass_the_max_index() {
-        assert_eq!(next_probe(&[], 5, 1, &BTreeMap::new()), ProbeStep::Probe(0));
+        assert_eq!(
+            next_probe(&[], 5, 1, &BTreeMap::new(), 0),
+            ProbeStep::Probe(0)
+        );
         let mut probed = BTreeMap::from([(0, true), (1, true)]);
         assert_eq!(
-            next_probe(&[], 2, 1, &probed),
+            next_probe(&[], 2, 1, &probed, 0),
             ProbeStep::Exceeded { index: 2 }
         );
         probed.insert(2, false);
@@ -150,11 +169,42 @@ mod tests {
             used_change: vec![],
             receive_cursor: 0,
         };
-        assert_eq!(allocate_receive(&mut cache, false), 1);
+        assert_eq!(allocate_receive(&mut cache, false, 200, 20).unwrap(), 1);
         assert_eq!(cache.receive_cursor, 0);
-        assert_eq!(allocate_receive(&mut cache, true), 1);
+        assert_eq!(allocate_receive(&mut cache, true, 200, 20).unwrap(), 1);
         assert_eq!(cache.receive_cursor, 2);
-        assert_eq!(allocate_receive(&mut cache, false), 3);
+        assert_eq!(allocate_receive(&mut cache, false, 200, 20).unwrap(), 3);
         assert_eq!(next_unused(&[0], 0), 1);
+    }
+
+    #[test]
+    fn issued_indexes_are_probed_before_the_gap() {
+        let mut probed = BTreeMap::new();
+        let mut last = 0;
+        for _ in 0..21 {
+            match next_probe(&[], 20, 200, &probed, 21) {
+                ProbeStep::Probe(index) => {
+                    probed.insert(index, false);
+                    last = index;
+                }
+                other => panic!("expected a probe, got {other:?}"),
+            }
+        }
+        assert_eq!(last, 20);
+        assert_eq!(next_probe(&[], 20, 200, &probed, 21), ProbeStep::Probe(21));
+    }
+
+    #[test]
+    fn allocation_refuses_an_index_whose_gap_passes_the_max() {
+        let mut cache = ScanCache {
+            receive_cursor: 181,
+            ..ScanCache::default()
+        };
+        let err = allocate_receive(&mut cache, true, 200, 20).unwrap_err();
+        assert!(err.contains("MAX_SCAN_INDEX"), "{err}");
+        assert_eq!(cache.receive_cursor, 181);
+        cache.receive_cursor = 180;
+        assert_eq!(allocate_receive(&mut cache, true, 200, 20).unwrap(), 180);
+        assert_eq!(cache.receive_cursor, 181);
     }
 }

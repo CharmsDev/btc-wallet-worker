@@ -1,5 +1,6 @@
 use crate::scan::{allocate_receive, merge_used, ScanCache};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const DAY_MS: u64 = 86_400_000;
 const RETAIN_MS: u64 = 30 * DAY_MS;
@@ -64,6 +65,8 @@ pub enum GuardOp {
     },
     AllocateReceive {
         advance: bool,
+        max_index: u32,
+        gap: u32,
     },
     GetOauth,
     PutOauth {
@@ -98,8 +101,31 @@ pub fn merge_scan(cache: &ScanCache, external: &[u32], change: &[u32]) -> ScanCa
     }
 }
 
-pub fn take_receive(cache: &mut ScanCache, advance: bool) -> u32 {
-    allocate_receive(cache, advance)
+pub fn take_receive(
+    cache: &mut ScanCache,
+    advance: bool,
+    max_index: u32,
+    gap: u32,
+) -> Result<u32, String> {
+    allocate_receive(cache, advance, max_index, gap)
+}
+
+pub fn unlogged_spend_warning(detail: &str) -> String {
+    format!("spend log was not recorded: {detail}")
+}
+
+pub fn attach_log_warning(mut body: Value, warning: Option<String>) -> Value {
+    if let Some(warning) = warning {
+        body["spend_log_warning"] = Value::String(warning);
+    }
+    body
+}
+
+pub fn join_log_warning(message: &str, warning: Option<String>) -> String {
+    match warning {
+        Some(warning) => format!("{message}; {warning}"),
+        None => message.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +166,21 @@ mod tests {
         let recent = log.recent(10);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].txid, "bb".repeat(32));
+    }
+
+    #[test]
+    fn a_failed_spend_log_is_visible_on_the_response() {
+        let warning = Some(unlogged_spend_warning("storage failed"));
+        let body = attach_log_warning(serde_json::json!({ "signed": true }), warning.clone());
+        assert_eq!(
+            body["spend_log_warning"],
+            "spend log was not recorded: storage failed"
+        );
+        let clean = attach_log_warning(serde_json::json!({ "signed": true }), None);
+        assert!(clean.get("spend_log_warning").is_none());
+        assert_eq!(
+            join_log_warning("broadcast rejected", warning),
+            "broadcast rejected; spend log was not recorded: storage failed"
+        );
     }
 }

@@ -130,7 +130,7 @@ fn initialize_result(id: &Value, params: Option<&Value>) -> Value {
             "protocolVersion": version,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "satchel", "title": "Satchel", "version": "0.1.0" },
-            "instructions": "Satchel is a hot Bitcoin wallet. send and sign_psbt default to a dry run. Set broadcast to true only when funds should move. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS."
+            "instructions": "Satchel is a hot Bitcoin wallet. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt always signs, even when broadcast is false, and the returned PSBT can be broadcast elsewhere. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS."
         }),
     )
 }
@@ -357,6 +357,10 @@ mod tests {
                 assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
                 assert!(body["result"]["capabilities"]["tools"].is_object());
                 assert_eq!(body["result"]["serverInfo"]["name"], "satchel");
+                let instructions = body["result"]["instructions"].as_str().unwrap();
+                assert!(instructions.contains("send defaults to an unsigned dry run"));
+                assert!(instructions.contains("sign_psbt always signs"));
+                assert!(!instructions.contains("sign_psbt default"));
             }
             other => panic!("expected reply, got {other:?}"),
         }

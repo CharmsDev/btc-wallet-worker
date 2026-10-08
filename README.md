@@ -48,8 +48,8 @@ Vars live in `wrangler.toml`. Secrets are set with `wrangler secret put` and are
 | `NETWORK` | var | `mainnet` | `mainnet`, `testnet`, `signet`, or `regtest` |
 | `SCRIPT` | var | `bip84` | `bip84` (native segwit) or `bip86` (taproot) |
 | `ACCOUNT` | var | `0` | BIP44 account index |
-| `GAP_LIMIT` | var | `20` | Unused-address gap on both chains |
-| `MAX_SCAN_INDEX` | var | `200` | Highest index the scan will probe |
+| `GAP_LIMIT` | var | `20` | Unused-address gap counted after issued receive indexes |
+| `MAX_SCAN_INDEX` | var | `200` | Highest index discovery will probe. `address` will not issue an index whose trailing gap would pass it |
 | `MAX_CHAIN_CALLS` | var | `80` | Esplora calls allowed in one tool call |
 | `FEE_TARGET_BLOCKS` | var | `3` | Confirmation target when `feerate` is omitted |
 | `MAX_TX_INPUT_SATS` | var | `100000` | Max sum of all input values in one transaction |
@@ -134,15 +134,13 @@ To revoke one agent, remove its name from `MCP_CLIENT_TOKENS` and run `wrangler 
 
 The worker is a hot wallet. A stolen bearer token, a stolen Access service token, or a bug in an agent can spend the coins this wallet can sign. Keep the balance small.
 
-The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every input in the transaction must be within that number, for `send` and for `sign_psbt`. `sign_psbt` refuses a PSBT when any input has no `witness_utxo` and no `non_witness_utxo`. The check runs before a signature is created. There is no rolling daily cap, no feerate cap, and no separate fee cap. A fee cannot exceed the inputs, so the input cap is also the most one transaction can lose.
+The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every input in the transaction must be within that number, for `send` and for `sign_psbt`. `send` skips a coin that would push the selection over that cap and tries a smaller set, so a large coin does not block a payment a smaller coin can fund. `sign_psbt` refuses a PSBT when any input has no `witness_utxo` and no `non_witness_utxo`. The check runs before a signature is created. There is no rolling daily cap, no feerate cap, and no separate fee cap. A fee cannot exceed the inputs, so the input cap is also the most one transaction can lose.
 
 Signing allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected.
 
-The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction.
+The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction. The worker retries a failed log write once. If it still fails, the signature is returned and the response includes `spend_log_warning`.
 
-The scan remembers which addresses have been used. Later calls only probe the gap past the last used index, plus holes that were never used. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
-
-The scan remembers which addresses have been used. Later calls only probe the gap past the last used index, plus holes that were never used. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
+Discovery probes every issued receive index before it counts the unused gap, so a deposit to an address from `address` stays visible when earlier indexes are unused. It also probes the gap past the last used index. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
 
 ## Local development
 

@@ -3,7 +3,7 @@ use crate::wallet::{xonly_of, ChainKind, ScriptKind, Wallet};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bitcoin::absolute::LockTime;
-use bitcoin::bip32::{DerivationPath, Fingerprint};
+use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(test)]
 use bitcoin::hashes::Hash;
@@ -17,7 +17,7 @@ use bitcoin::{
     Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 const DUST_SATS: u64 = 546;
@@ -58,6 +58,7 @@ pub struct Payment<'a> {
     pub amount: u64,
     pub feerate: u64,
     pub change: &'a Address,
+    pub max_input_sats: u64,
 }
 
 pub fn build_payment(payment: &Payment<'_>) -> Result<Built, String> {
@@ -67,26 +68,62 @@ pub fn build_payment(payment: &Payment<'_>) -> Result<Built, String> {
             payment.amount
         ));
     }
-    let mut ordered: Vec<&Coin> = payment.coins.iter().collect();
-    ordered.sort_by(|left, right| {
+    let mut pool: Vec<&Coin> = payment
+        .coins
+        .iter()
+        .filter(|coin| coin.value <= payment.max_input_sats)
+        .collect();
+    pool.sort_by(|left, right| {
         right
             .confirmed
             .cmp(&left.confirmed)
             .then(right.value.cmp(&left.value))
     });
+    let attempts = pool.len().min(16);
+    for _ in 0..attempts {
+        if let Some(built) = select_fitting(payment, &pool)? {
+            return Ok(built);
+        }
+        if pool.len() <= 1 {
+            break;
+        }
+        pool.remove(0);
+    }
+    if payment.coins.is_empty()
+        || payment
+            .coins
+            .iter()
+            .any(|coin| coin.value <= payment.max_input_sats)
+    {
+        Err("not enough funds".into())
+    } else {
+        Err(format!(
+            "no coin selection fits MAX_TX_INPUT_SATS ({})",
+            payment.max_input_sats
+        ))
+    }
+}
+
+fn select_fitting(payment: &Payment<'_>, ordered: &[&Coin]) -> Result<Option<Built>, String> {
     let mut selected: Vec<&Coin> = Vec::new();
     let mut total = 0u64;
     for coin in ordered {
+        let Some(next) = total.checked_add(coin.value) else {
+            continue;
+        };
+        if next > payment.max_input_sats {
+            continue;
+        }
         selected.push(coin);
-        total = total.saturating_add(coin.value);
+        total = next;
         if let Some(built) = try_selection(payment, &selected, total, true)? {
-            return Ok(built);
+            return Ok(Some(built));
         }
         if let Some(built) = try_selection(payment, &selected, total, false)? {
-            return Ok(built);
+            return Ok(Some(built));
         }
     }
-    Err("not enough funds".into())
+    Ok(None)
 }
 
 fn try_selection(
@@ -543,6 +580,69 @@ pub fn parse_txid(value: &str) -> Result<Txid, String> {
     Txid::from_str(value).map_err(|_| "utxo txid is invalid".to_string())
 }
 
+pub fn indexes_from_origins(wallet: &Wallet, psbt: &Psbt) -> BTreeSet<(ChainKind, u32)> {
+    let mut indexes = BTreeSet::new();
+    for input in &psbt.inputs {
+        for (fingerprint, path) in input.bip32_derivation.values() {
+            remember_origin(wallet, *fingerprint, path, &mut indexes);
+        }
+        for (_, (fingerprint, path)) in input.tap_key_origins.values() {
+            remember_origin(wallet, *fingerprint, path, &mut indexes);
+        }
+    }
+    indexes
+}
+
+fn remember_origin(
+    wallet: &Wallet,
+    fingerprint: Fingerprint,
+    path: &DerivationPath,
+    indexes: &mut BTreeSet<(ChainKind, u32)>,
+) {
+    if fingerprint != wallet.fingerprint() {
+        return;
+    }
+    if let Some(index) = path_index(wallet, path) {
+        indexes.insert(index);
+    }
+}
+
+fn path_index(wallet: &Wallet, path: &DerivationPath) -> Option<(ChainKind, u32)> {
+    let parts: Vec<ChildNumber> = path.into_iter().copied().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let purpose = hardened(&parts[0])?;
+    let coin = hardened(&parts[1])?;
+    let account = hardened(&parts[2])?;
+    if purpose != wallet.script().purpose() || coin != wallet.network().coin_type() {
+        return None;
+    }
+    if account != wallet.account() {
+        return None;
+    }
+    let chain = match normal(&parts[3])? {
+        0 => ChainKind::External,
+        1 => ChainKind::Change,
+        _ => return None,
+    };
+    Some((chain, normal(&parts[4])?))
+}
+
+fn hardened(child: &ChildNumber) -> Option<u32> {
+    match *child {
+        ChildNumber::Hardened { index } => Some(index),
+        ChildNumber::Normal { .. } => None,
+    }
+}
+
+fn normal(child: &ChildNumber) -> Option<u32> {
+    match *child {
+        ChildNumber::Normal { index } => Some(index),
+        ChildNumber::Hardened { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +659,18 @@ mod tests {
         amount: u64,
         feerate: u64,
     ) -> Result<Built, String> {
+        pay_capped(wallet, coins, dest, change, amount, feerate, u64::MAX)
+    }
+
+    fn pay_capped<'a>(
+        wallet: &'a Wallet,
+        coins: &'a [Coin],
+        dest: &'a Address,
+        change: &'a Address,
+        amount: u64,
+        feerate: u64,
+        max_input_sats: u64,
+    ) -> Result<Built, String> {
         build_payment(&Payment {
             script: wallet.script(),
             fingerprint: wallet.fingerprint(),
@@ -567,6 +679,7 @@ mod tests {
             amount,
             feerate,
             change,
+            max_input_sats,
         })
     }
 
@@ -766,5 +879,87 @@ mod tests {
             .unwrap_err()
             .contains("not allowed"));
         assert!(rejected.inputs[0].tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn a_smaller_coin_funds_a_payment_the_largest_coin_cannot() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let big = coin_at(&wallet, 0, 150_000);
+        let small = coin_at(&wallet, 1, 50_000);
+        let dest = wallet.derive(ChainKind::External, 2).unwrap().address;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let built = pay_capped(
+            &wallet,
+            &[big, small.clone()],
+            &dest,
+            &change,
+            20_000,
+            2,
+            100_000,
+        )
+        .unwrap();
+        assert_eq!(built.psbt.unsigned_tx.input.len(), 1);
+        assert_eq!(
+            built.psbt.unsigned_tx.input[0].previous_output.txid,
+            small.txid
+        );
+        assert_eq!(transaction_input_sats(&built.psbt).unwrap(), 50_000);
+
+        let blocked = coin_at(&wallet, 3, 60_000);
+        let left = coin_at(&wallet, 4, 45_000);
+        let right = coin_at(&wallet, 5, 45_000);
+        let split = pay_capped(
+            &wallet,
+            &[blocked, left, right],
+            &dest,
+            &change,
+            70_000,
+            1,
+            100_000,
+        )
+        .unwrap();
+        assert_eq!(split.psbt.unsigned_tx.input.len(), 2);
+        assert_eq!(transaction_input_sats(&split.psbt).unwrap(), 90_000);
+
+        let oversized = coin_at(&wallet, 6, 150_000);
+        let err = pay_capped(
+            &wallet,
+            std::slice::from_ref(&oversized),
+            &dest,
+            &change,
+            20_000,
+            1,
+            100_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("MAX_TX_INPUT_SATS"), "{err}");
+    }
+
+    #[test]
+    fn taproot_key_origins_identify_an_owned_input() {
+        let wallet = wallet(ScriptKind::Bip86);
+        let coin = coin_at(&wallet, 50, 40_000);
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let mut psbt = pay(
+            &wallet,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            10_000,
+            1,
+        )
+        .unwrap()
+        .psbt;
+        psbt.inputs[0].bip32_derivation.clear();
+        assert!(!psbt.inputs[0].tap_key_origins.is_empty());
+        let indexes = indexes_from_origins(&wallet, &psbt);
+        assert!(indexes.contains(&(ChainKind::External, 50)));
+        let mut owned = BTreeMap::new();
+        for (chain, index) in indexes {
+            let derived = wallet.derive(chain, index).unwrap();
+            owned.insert(derived.address.script_pubkey(), (chain, index));
+        }
+        inspect_psbt(&psbt, &owned, ScriptKind::Bip86, Network::Bitcoin).unwrap();
     }
 }
