@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `wrangler dev`. Never commit .dev.vars.
+# Replace the placeholder mnemonic. Do not use a mnemonic that already holds funds.
+BTC_WALLET_SEED="replace this with a 12 or 24 word BIP39 mnemonic"
+MCP_CLIENT_TOKENS={"local":"replace-with-a-long-random-token"}
+
+# Optional. Format is client_id:client_secret. Omit it to use public Esplora only.
+# BLOCKSTREAM_API_KEY="client_id:client_secret"
