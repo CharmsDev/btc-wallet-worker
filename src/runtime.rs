@@ -20,7 +20,7 @@ use crate::wallet::{parse_address, ChainKind, Wallet};
 use bitcoin::psbt::Psbt;
 use bitcoin::ScriptBuf;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use worker::*;
@@ -35,6 +35,7 @@ struct JwksCache {
 
 thread_local! {
     static JWKS: RefCell<Option<JwksCache>> = const { RefCell::new(None) };
+    static LOG_SEQ: Cell<u64> = const { Cell::new(0) };
 }
 
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -577,20 +578,15 @@ impl App<'_> {
         kind: SpendKind,
         _request_id: Option<String>,
     ) -> Option<String> {
-        let at_ms = Date::now().as_millis();
-        let kind_name = match kind {
-            SpendKind::Send => "send",
-            SpendKind::Sign => "sign",
-        };
         let record = SpendRecord {
             txid: txid.to_string(),
             input_sats,
             dest: dest.to_string(),
             fee_sats,
-            at_ms,
+            at_ms: Date::now().as_millis(),
             client: self.client.clone(),
             kind,
-            id: format!("{kind_name}:{txid}:{}:{at_ms}", self.client),
+            id: fresh_log_id(),
         };
         let mut detail = "spend guard unavailable".to_string();
         for _ in 0..2 {
@@ -852,6 +848,20 @@ fn owned_scripts(
         }
     }
     Ok(owned)
+}
+
+fn fresh_log_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let tick = Date::now().as_millis();
+        bytes[..8].copy_from_slice(&tick.to_le_bytes());
+        LOG_SEQ.with(|seq| {
+            let next = seq.get().wrapping_add(1);
+            seq.set(next);
+            bytes[8..16].copy_from_slice(&next.to_le_bytes());
+        });
+    }
+    hex::encode(bytes)
 }
 
 fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {

@@ -176,6 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn different_ids_keep_two_calls_from_the_same_millisecond() {
+        let mut log = SpendLog::default();
+        let mut first = record(&"aa".repeat(32), 10);
+        let mut second = record(&"aa".repeat(32), 10);
+        first.id = "call-1".into();
+        second.id = "call-2".into();
+        log.append(first, 30);
+        log.append(second.clone(), 30);
+        log.append(second, 30);
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|row| row.id == "call-1"));
+        assert!(recent.iter().any(|row| row.id == "call-2"));
+    }
+
+    #[test]
     fn a_repeated_append_with_the_same_id_is_one_row() {
         let mut log = SpendLog::default();
         let row = record(&"aa".repeat(32), 10);
