@@ -1,0 +1,221 @@
+use crate::scan::{allocate_receive, merge_used, ScanCache};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+const DAY_MS: u64 = 86_400_000;
+const RETAIN_MS: u64 = 30 * DAY_MS;
+const MAX_RECORDS: usize = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpendKind {
+    Send,
+    Sign,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendRecord {
+    pub txid: String,
+    pub input_sats: u64,
+    pub dest: String,
+    pub fee_sats: u64,
+    pub at_ms: u64,
+    pub client: String,
+    pub kind: SpendKind,
+    /// Stable for one signing call, including a retry after a lost reply.
+    #[serde(default)]
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendLog {
+    spends: Vec<SpendRecord>,
+}
+
+impl SpendLog {
+    pub fn append(&mut self, record: SpendRecord, now_ms: u64) {
+        let start = now_ms.saturating_sub(RETAIN_MS);
+        self.spends.retain(|spend| spend.at_ms >= start);
+        if !record.id.is_empty() && self.spends.iter().any(|spend| spend.id == record.id) {
+            return;
+        }
+        self.spends.push(record);
+        if self.spends.len() > MAX_RECORDS {
+            let overflow = self.spends.len() - MAX_RECORDS;
+            self.spends.drain(0..overflow);
+        }
+    }
+
+    pub fn recent(&self, limit: u32) -> Vec<SpendRecord> {
+        let limit = limit.clamp(1, 200) as usize;
+        let mut spends = self.spends.clone();
+        spends.sort_by_key(|spend| std::cmp::Reverse(spend.at_ms));
+        spends.truncate(limit);
+        spends
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum GuardOp {
+    AppendSpend {
+        record: SpendRecord,
+    },
+    SpendLog {
+        limit: u32,
+    },
+    GetScan,
+    MergeScan {
+        used_external: Vec<u32>,
+        used_change: Vec<u32>,
+    },
+    AllocateReceive {
+        advance: bool,
+        max_index: u32,
+        gap: u32,
+    },
+    GetOauth,
+    PutOauth {
+        access_token: String,
+        exp_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuardReply {
+    Appended,
+    Log { spends: Vec<SpendRecord> },
+    Scan { cache: ScanCache },
+    ReceiveIndex { index: u32 },
+    Oauth { access_token: String, exp_ms: u64 },
+    OauthMiss,
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OauthCache {
+    pub access_token: String,
+    pub exp_ms: u64,
+}
+
+pub fn merge_scan(cache: &ScanCache, external: &[u32], change: &[u32]) -> ScanCache {
+    ScanCache {
+        used_external: merge_used(&cache.used_external, external),
+        used_change: merge_used(&cache.used_change, change),
+        receive_cursor: cache.receive_cursor,
+    }
+}
+
+pub fn take_receive(
+    cache: &mut ScanCache,
+    advance: bool,
+    max_index: u32,
+    gap: u32,
+) -> Result<u32, String> {
+    allocate_receive(cache, advance, max_index, gap)
+}
+
+pub fn unlogged_spend_warning(detail: &str) -> String {
+    format!("spend log was not recorded: {detail}")
+}
+
+pub fn attach_log_warning(mut body: Value, warning: Option<String>) -> Value {
+    if let Some(warning) = warning {
+        body["spend_log_warning"] = Value::String(warning);
+    }
+    body
+}
+
+pub fn join_log_warning(message: &str, warning: Option<String>) -> String {
+    match warning {
+        Some(warning) => format!("{message}; {warning}"),
+        None => message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(txid: &str, at_ms: u64) -> SpendRecord {
+        SpendRecord {
+            txid: txid.to_string(),
+            input_sats: 50_000,
+            dest: "bc1qexample".into(),
+            fee_sats: 200,
+            at_ms,
+            client: "cursor".into(),
+            kind: SpendKind::Send,
+            id: format!("send:{txid}:{at_ms}"),
+        }
+    }
+
+    #[test]
+    fn the_log_appends_and_returns_newest_first() {
+        let mut log = SpendLog::default();
+        log.append(record(&"aa".repeat(32), 10), 30);
+        log.append(record(&"bb".repeat(32), 20), 30);
+        let recent = log.recent(10);
+        assert_eq!(recent[0].txid, "bb".repeat(32));
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].input_sats, 50_000);
+    }
+
+    #[test]
+    fn rows_older_than_thirty_days_drop_off_the_log() {
+        let mut log = SpendLog::default();
+        log.append(record(&"aa".repeat(32), 10), 10);
+        log.append(
+            record(&"bb".repeat(32), 20 + RETAIN_MS + 1),
+            20 + RETAIN_MS + 1,
+        );
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].txid, "bb".repeat(32));
+    }
+
+    #[test]
+    fn different_ids_keep_two_calls_from_the_same_millisecond() {
+        let mut log = SpendLog::default();
+        let mut first = record(&"aa".repeat(32), 10);
+        let mut second = record(&"aa".repeat(32), 10);
+        first.id = "call-1".into();
+        second.id = "call-2".into();
+        log.append(first, 30);
+        log.append(second.clone(), 30);
+        log.append(second, 30);
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|row| row.id == "call-1"));
+        assert!(recent.iter().any(|row| row.id == "call-2"));
+    }
+
+    #[test]
+    fn a_repeated_append_with_the_same_id_is_one_row() {
+        let mut log = SpendLog::default();
+        let row = record(&"aa".repeat(32), 10);
+        log.append(row.clone(), 30);
+        log.append(row, 30);
+        assert_eq!(log.recent(10).len(), 1);
+        let other = record(&"bb".repeat(32), 11);
+        log.append(other, 30);
+        assert_eq!(log.recent(10).len(), 2);
+    }
+
+    #[test]
+    fn a_failed_spend_log_is_visible_on_the_response() {
+        let warning = Some(unlogged_spend_warning("storage failed"));
+        let body = attach_log_warning(serde_json::json!({ "signed": true }), warning.clone());
+        assert_eq!(
+            body["spend_log_warning"],
+            "spend log was not recorded: storage failed"
+        );
+        let clean = attach_log_warning(serde_json::json!({ "signed": true }), None);
+        assert!(clean.get("spend_log_warning").is_none());
+        assert_eq!(
+            join_log_warning("broadcast rejected", warning),
+            "broadcast rejected; spend log was not recorded: storage failed"
+        );
+    }
+}
