@@ -138,7 +138,7 @@ The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every 
 
 Signing allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected.
 
-The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction. The worker retries a failed log write once. If it still fails, the signature is returned and the response includes `spend_log_warning`.
+The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction. The worker retries a failed log write once. The retry uses the same log id, so a lost success does not add a second row. If it still fails, the signature is returned and the response includes `spend_log_warning`.
 
 Discovery probes every issued receive index before it counts the unused gap, so a deposit to an address from `address` stays visible when earlier indexes are unused. It also probes the gap past the last used index. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
 

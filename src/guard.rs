@@ -22,6 +22,9 @@ pub struct SpendRecord {
     pub at_ms: u64,
     pub client: String,
     pub kind: SpendKind,
+    /// Stable for one signing call, including a retry after a lost reply.
+    #[serde(default)]
+    pub id: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +36,9 @@ impl SpendLog {
     pub fn append(&mut self, record: SpendRecord, now_ms: u64) {
         let start = now_ms.saturating_sub(RETAIN_MS);
         self.spends.retain(|spend| spend.at_ms >= start);
+        if !record.id.is_empty() && self.spends.iter().any(|spend| spend.id == record.id) {
+            return;
+        }
         self.spends.push(record);
         if self.spends.len() > MAX_RECORDS {
             let overflow = self.spends.len() - MAX_RECORDS;
@@ -141,6 +147,7 @@ mod tests {
             at_ms,
             client: "cursor".into(),
             kind: SpendKind::Send,
+            id: format!("send:{txid}:{at_ms}"),
         }
     }
 
@@ -166,6 +173,18 @@ mod tests {
         let recent = log.recent(10);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].txid, "bb".repeat(32));
+    }
+
+    #[test]
+    fn a_repeated_append_with_the_same_id_is_one_row() {
+        let mut log = SpendLog::default();
+        let row = record(&"aa".repeat(32), 10);
+        log.append(row.clone(), 30);
+        log.append(row, 30);
+        assert_eq!(log.recent(10).len(), 1);
+        let other = record(&"bb".repeat(32), 11);
+        log.append(other, 30);
+        assert_eq!(log.recent(10).len(), 2);
     }
 
     #[test]

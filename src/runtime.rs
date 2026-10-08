@@ -577,14 +577,20 @@ impl App<'_> {
         kind: SpendKind,
         _request_id: Option<String>,
     ) -> Option<String> {
+        let at_ms = Date::now().as_millis();
+        let kind_name = match kind {
+            SpendKind::Send => "send",
+            SpendKind::Sign => "sign",
+        };
         let record = SpendRecord {
             txid: txid.to_string(),
             input_sats,
             dest: dest.to_string(),
             fee_sats,
-            at_ms: Date::now().as_millis(),
+            at_ms,
             client: self.client.clone(),
             kind,
+            id: format!("{kind_name}:{txid}:{}:{at_ms}", self.client),
         };
         let mut detail = "spend guard unavailable".to_string();
         for _ in 0..2 {
