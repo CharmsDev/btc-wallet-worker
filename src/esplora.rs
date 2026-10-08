@@ -444,30 +444,6 @@ pub fn fold_broadcast(attempts: &[RawAttempt]) -> BroadcastVerdict {
     BroadcastVerdict::Unknown { detail: last }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Presence {
-    Found,
-    Missing,
-    Unclear,
-}
-
-pub fn fold_presence(probes: &[Presence]) -> Option<bool> {
-    if probes.contains(&Presence::Found) {
-        return Some(true);
-    }
-    if !probes.is_empty() && probes.iter().all(|probe| *probe == Presence::Missing) {
-        return Some(false);
-    }
-    None
-}
-
-pub fn release_after_broadcast(verdict: &BroadcastVerdict, seen: Option<bool>) -> bool {
-    match verdict {
-        BroadcastVerdict::Accepted | BroadcastVerdict::Unknown { .. } => false,
-        BroadcastVerdict::Rejected { .. } => seen == Some(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,16 +619,12 @@ mod tests {
             },
         ]);
         assert!(matches!(verdict, BroadcastVerdict::Unknown { .. }));
-        assert!(!release_after_broadcast(&verdict, Some(false)));
 
         let verdict = fold_broadcast(&[RawAttempt::Http {
             status: 400,
             body: "sendrawtransaction RPC error: bad-txns-inputs-missingorspent".into(),
         }]);
         assert!(matches!(verdict, BroadcastVerdict::Rejected { .. }));
-        assert!(release_after_broadcast(&verdict, Some(false)));
-        assert!(!release_after_broadcast(&verdict, Some(true)));
-        assert!(!release_after_broadcast(&verdict, None));
 
         let verdict = fold_broadcast(&[
             RawAttempt::Transport {
@@ -664,15 +636,5 @@ mod tests {
             },
         ]);
         assert!(matches!(verdict, BroadcastVerdict::Unknown { .. }));
-
-        assert_eq!(fold_presence(&[Presence::Missing, Presence::Unclear]), None);
-        assert_eq!(
-            fold_presence(&[Presence::Missing, Presence::Missing]),
-            Some(false)
-        );
-        assert_eq!(
-            fold_presence(&[Presence::Missing, Presence::Found]),
-            Some(true)
-        );
     }
 }

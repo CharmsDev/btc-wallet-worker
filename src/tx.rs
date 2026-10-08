@@ -1,4 +1,4 @@
-use crate::policy::{check_fee, fee_for_vsize, SpendPolicy};
+use crate::policy::enforce_input_cap;
 use crate::wallet::{xonly_of, ChainKind, ScriptKind, Wallet};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -58,7 +58,6 @@ pub struct Payment<'a> {
     pub amount: u64,
     pub feerate: u64,
     pub change: &'a Address,
-    pub policy: &'a SpendPolicy,
 }
 
 pub fn build_payment(payment: &Payment<'_>) -> Result<Built, String> {
@@ -66,12 +65,6 @@ pub fn build_payment(payment: &Payment<'_>) -> Result<Built, String> {
         return Err(format!(
             "amount {} sats is below the dust limit of {DUST_SATS}",
             payment.amount
-        ));
-    }
-    if payment.feerate > payment.policy.max_feerate_sat_vb {
-        return Err(format!(
-            "feerate {} sat/vB exceeds max {} sat/vB",
-            payment.feerate, payment.policy.max_feerate_sat_vb
         ));
     }
     let mut ordered: Vec<&Coin> = payment.coins.iter().collect();
@@ -107,7 +100,6 @@ fn try_selection(
     let amount = payment.amount;
     let feerate = payment.feerate;
     let change = payment.change;
-    let policy = payment.policy;
     let fingerprint = payment.fingerprint;
     let outputs_for_size = if with_change {
         vec![
@@ -119,15 +111,9 @@ fn try_selection(
     };
     let provisional = unsigned_tx(coins, &outputs_for_size);
     let vsize = witnessed_vsize(&provisional, script);
-    let Some(fee) = fee_for_vsize(feerate, vsize) else {
+    let Some(fee) = feerate.checked_mul(vsize) else {
         return Err("fee overflow".into());
     };
-    if fee > policy.max_fee_sats {
-        return Err(format!(
-            "fee {fee} sats exceeds max fee {} sats",
-            policy.max_fee_sats
-        ));
-    }
     let need = amount.saturating_add(fee);
     if total < need {
         return Ok(None);
@@ -154,13 +140,6 @@ fn try_selection(
         )
     } else {
         let fee = total - amount;
-        if fee > policy.max_fee_sats {
-            return Ok(None);
-        }
-        let rate = check_fee(fee, vsize, policy).map_err(|err| err.to_string())?;
-        if rate > policy.max_feerate_sat_vb {
-            return Ok(None);
-        }
         (
             fee,
             vec![BuiltOutput {
@@ -179,7 +158,10 @@ fn try_selection(
         .collect::<Result<Vec<_>, _>>()?;
     let tx = unsigned_tx(coins, &tx_outputs);
     let actual_vsize = witnessed_vsize(&tx, script);
-    let rate = check_fee(fee, actual_vsize, policy).map_err(|err| err.to_string())?;
+    if actual_vsize == 0 {
+        return Err("transaction size is zero".into());
+    }
+    let rate = fee.div_ceil(actual_vsize);
     let psbt = fill_psbt(tx, coins, fingerprint, script)?;
     Ok(Some(Built {
         psbt,
@@ -415,7 +397,28 @@ pub fn annotate_owned_inputs(
     Ok(())
 }
 
-pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt) -> Result<(), String> {
+pub fn transaction_input_sats(psbt: &Psbt) -> Result<u64, String> {
+    if psbt.inputs.is_empty() {
+        return Err("transaction has no inputs".into());
+    }
+    let mut total = 0u64;
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        let value = match input_utxo(input, &psbt.unsigned_tx.input[index]) {
+            Ok(utxo) => utxo.value.to_sat(),
+            Err(_) => {
+                return Err(format!("psbt input {index} is missing a value"));
+            }
+        };
+        total = total
+            .checked_add(value)
+            .ok_or_else(|| "input sum overflow".to_string())?;
+    }
+    Ok(total)
+}
+
+pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt, max_input_sats: u64) -> Result<u64, String> {
+    let input_sats = transaction_input_sats(psbt)?;
+    enforce_input_cap(input_sats, max_input_sats)?;
     require_committing_sighash(psbt, wallet)?;
     let secp = Secp256k1::new();
     match psbt.sign(wallet.master_key(), &secp) {
@@ -427,7 +430,7 @@ pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt) -> Result<(), String> {
         }
     }
     finalize_signed_inputs(psbt);
-    Ok(())
+    Ok(input_sats)
 }
 
 fn require_committing_sighash(psbt: &Psbt, wallet: &Wallet) -> Result<(), String> {
@@ -556,7 +559,6 @@ mod tests {
         amount: u64,
         feerate: u64,
     ) -> Result<Built, String> {
-        let policy = SpendPolicy::default();
         build_payment(&Payment {
             script: wallet.script(),
             fingerprint: wallet.fingerprint(),
@@ -565,7 +567,6 @@ mod tests {
             amount,
             feerate,
             change,
-            policy: &policy,
         })
     }
 
@@ -608,7 +609,7 @@ mod tests {
         assert!(unsigned.inputs[0].partial_sigs.is_empty());
 
         let mut signed = built.psbt.clone();
-        sign_psbt(&wallet, &mut signed).unwrap();
+        sign_psbt(&wallet, &mut signed, 100_000).unwrap();
         let (txid, _hex) = extract_signed(&signed).unwrap();
         assert_eq!(txid.len(), 64);
         let tx = signed.extract_tx().unwrap();
@@ -632,18 +633,18 @@ mod tests {
         )
         .unwrap();
         let mut signed = built.psbt.clone();
-        sign_psbt(&wallet, &mut signed).unwrap();
+        sign_psbt(&wallet, &mut signed, 100_000).unwrap();
         let (txid, _) = extract_signed(&signed).unwrap();
         assert_eq!(txid.len(), 64);
     }
 
     #[test]
-    fn high_feerate_and_dust_are_rejected() {
+    fn dust_is_rejected_and_a_high_feerate_is_not_a_cap() {
         let wallet = wallet(ScriptKind::Bip84);
         let coin = coin_at(&wallet, 0, 50_000);
         let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
         let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
-        let err = pay(
+        let built = pay(
             &wallet,
             std::slice::from_ref(&coin),
             &dest,
@@ -651,10 +652,37 @@ mod tests {
             20_000,
             201,
         )
-        .unwrap_err();
-        assert!(err.contains("feerate"));
+        .unwrap();
+        assert!(built.feerate_sat_vb >= 201);
         let err = pay(&wallet, std::slice::from_ref(&coin), &dest, &change, 100, 1).unwrap_err();
         assert!(err.contains("dust"));
+    }
+
+    #[test]
+    fn the_input_cap_runs_before_a_signature_exists() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&wallet, 0, 50_000);
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let mut psbt = pay(
+            &wallet,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            20_000,
+            2,
+        )
+        .unwrap()
+        .psbt;
+        let err = sign_psbt(&wallet, &mut psbt, 49_999).unwrap_err();
+        assert!(err.contains("MAX_TX_INPUT_SATS"));
+        assert!(psbt.inputs[0].partial_sigs.is_empty());
+        sign_psbt(&wallet, &mut psbt, 50_000).unwrap();
+
+        psbt.inputs[0].witness_utxo = None;
+        psbt.inputs[0].non_witness_utxo = None;
+        let err = sign_psbt(&wallet, &mut psbt, 100_000).unwrap_err();
+        assert!(err.contains("missing a value"));
     }
 
     #[test]
@@ -715,7 +743,7 @@ mod tests {
             .unwrap()
             .psbt;
             psbt.inputs[0].sighash_type = Some(sighash.into());
-            let err = sign_psbt(&segwit, &mut psbt).unwrap_err();
+            let err = sign_psbt(&segwit, &mut psbt, 100_000).unwrap_err();
             assert!(err.contains("not allowed"), "{err}");
             assert!(psbt.inputs[0].partial_sigs.is_empty());
         }
@@ -728,13 +756,13 @@ mod tests {
             .unwrap()
             .psbt;
         allowed.inputs[0].sighash_type = Some(TapSighashType::All.into());
-        sign_psbt(&tap, &mut allowed).unwrap();
+        sign_psbt(&tap, &mut allowed, 100_000).unwrap();
 
         let mut rejected = pay(&tap, std::slice::from_ref(&coin), &dest, &change, 10_000, 1)
             .unwrap()
             .psbt;
         rejected.inputs[0].sighash_type = Some(TapSighashType::None.into());
-        assert!(sign_psbt(&tap, &mut rejected)
+        assert!(sign_psbt(&tap, &mut rejected, 100_000)
             .unwrap_err()
             .contains("not allowed"));
         assert!(rejected.inputs[0].tap_key_sig.is_none());

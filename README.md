@@ -52,10 +52,7 @@ Vars live in `wrangler.toml`. Secrets are set with `wrangler secret put` and are
 | `MAX_SCAN_INDEX` | var | `200` | Highest index the scan will probe |
 | `MAX_CHAIN_CALLS` | var | `80` | Esplora calls allowed in one tool call |
 | `FEE_TARGET_BLOCKS` | var | `3` | Confirmation target when `feerate` is omitted |
-| `PER_TX_CAP_SATS` | var | `100000` | Max sats leaving the wallet in one spend, including fee |
-| `ROLLING_24H_CAP_SATS` | var | `250000` | Max sats leaving the wallet in 24 hours |
-| `MAX_FEERATE_SAT_VB` | var | `200` | Max fee rate in sat/vB |
-| `MAX_FEE_SATS` | var | `20000` | Max absolute fee |
+| `MAX_TX_INPUT_SATS` | var | `100000` | Max sum of all input values in one transaction |
 | `ESPLORA_URLS` | var | empty | Comma-separated Esplora bases. Empty uses the defaults below |
 | `EXPECTED_FINGERPRINT` | var | empty | 8 hex characters. When set, signing is refused if the seed does not match |
 | `ACCESS_TEAM_DOMAIN` | var | empty | Team name or `team.cloudflareaccess.com`. Set with `ACCESS_AUD` |
@@ -85,7 +82,7 @@ The endpoint is `POST /mcp`. The body is one JSON-RPC 2.0 message. The server is
 
 Tools: `balance`, `address`, `history`, `utxos`, `fee_estimates`, `descriptor`, `send`, `sign_psbt`, `spend_log`.
 
-`send` and `sign_psbt` default to `broadcast: false`. `send` then returns the fee, vsize, outputs, cap status, and an unsigned PSBT. It signs and broadcasts only when `broadcast` is `true`. `sign_psbt` returns a signed PSBT only after the outflow is counted against the cap, because a signed PSBT can be broadcast elsewhere. `broadcast: true` on `sign_psbt` also submits the transaction.
+`send` and `sign_psbt` default to `broadcast: false`. `send` then returns the fee, vsize, outputs, input sum, and an unsigned PSBT. It signs and broadcasts only when `broadcast` is `true`. `sign_psbt` signs only when every input has a known value and the input sum is within `MAX_TX_INPUT_SATS`. `broadcast: true` on `sign_psbt` also submits the transaction.
 
 Cursor (`~/.cursor/mcp.json`):
 
@@ -135,13 +132,15 @@ To revoke one agent, remove its name from `MCP_CLIENT_TOKENS` and run `wrangler 
 
 ## Limits
 
-The worker is a hot wallet. A stolen bearer token, a stolen Access service token, or a bug in an agent can spend what the caps allow. Keep the balance small. The defaults are 100,000 sats per transaction and 250,000 sats per rolling 24 hours, with a fee cap of 20,000 sats and 200 sat/vB.
+The worker is a hot wallet. A stolen bearer token, a stolen Access service token, or a bug in an agent can spend the coins this wallet can sign. Keep the balance small.
 
-Caps are applied inside one Durable Object, `SpendGuard`, so two overlapping requests cannot both pass a check that only one of them should pass. A reservation counts against the cap immediately. It expires after two minutes if the worker crashes before commit. Broadcasting a transaction that the network rejects releases that reservation. Returning a signed PSBT does not release it.
+The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every input in the transaction must be within that number, for `send` and for `sign_psbt`. `sign_psbt` refuses a PSBT when any input has no `witness_utxo` and no `non_witness_utxo`. The check runs before a signature is created. There is no rolling daily cap, no feerate cap, and no separate fee cap. A fee cannot exceed the inputs, so the input cap is also the most one transaction can lose.
 
-`send` counts the payment plus the fee. `sign_psbt` counts the net sats leaving the wallet (inputs it owns, minus outputs that pay it). It signs only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected. A broadcast that fails in transit keeps the reservation. The reservation is released only when a backend rejects the transaction and no backend shows that txid.
+Signing allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected.
 
-The spend log stores txid, outflow, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped.
+The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction.
+
+The scan remembers which addresses have been used. Later calls only probe the gap past the last used index, plus holes that were never used. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
 
 The scan remembers which addresses have been used. Later calls only probe the gap past the last used index, plus holes that were never used. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
 

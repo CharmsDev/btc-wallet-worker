@@ -1,21 +1,19 @@
 use crate::auth::{verify_access_jwt, AccessRules, Clients};
 use crate::config::{Config, RawConfig};
 use crate::esplora::{
-    classify_attempt, fold_broadcast, fold_presence, form_encode, parse_address_stats,
-    parse_api_key, parse_fee_estimates, parse_history_page, parse_token_response, parse_utxos,
-    pick_feerate, release_after_broadcast, AddressStats, AttemptClass, BroadcastVerdict, Presence,
-    RawAttempt, Utxo,
+    classify_attempt, fold_broadcast, form_encode, parse_address_stats, parse_api_key,
+    parse_fee_estimates, parse_history_page, parse_token_response, parse_utxos, pick_feerate,
+    AddressStats, AttemptClass, BroadcastVerdict, RawAttempt, Utxo,
 };
 use crate::guard::{
-    merge_scan, take_receive, ApplyResult, Command, GuardOp, GuardReply, OauthCache, SpendIntent,
-    SpendKind,
+    merge_scan, take_receive, GuardOp, GuardReply, OauthCache, SpendKind, SpendRecord,
 };
 use crate::mcp::{self, Incoming, ToolCall};
-use crate::policy::SpendPolicy;
+use crate::policy::enforce_input_cap;
 use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
     annotate_owned_inputs, build_payment, extract_signed, inspect_psbt, psbt_from_base64,
-    psbt_to_base64, sign_psbt, Coin, Payment,
+    psbt_to_base64, sign_psbt, transaction_input_sats, Coin, Payment,
 };
 use crate::wallet::{parse_address, ChainKind, Wallet};
 use bitcoin::bip32::{ChildNumber, DerivationPath};
@@ -288,18 +286,9 @@ impl App<'_> {
     }
 
     async fn spend_log(&mut self, limit: u32) -> Result<Value, String> {
-        let reply = guard_call(
-            self.ctx,
-            &GuardOp::Apply {
-                command: Command::Log { limit },
-                policy: self.config.policy,
-            },
-        )
-        .await?;
+        let reply = guard_call(self.ctx, &GuardOp::SpendLog { limit }).await?;
         match reply {
-            GuardReply::Apply {
-                result: ApplyResult::Log { spends },
-            } => Ok(json!({ "spends": spends })),
+            GuardReply::Log { spends } => Ok(json!({ "spends": spends })),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
         }
@@ -333,64 +322,40 @@ impl App<'_> {
             amount: sats,
             feerate,
             change: &change,
-            policy: &self.config.policy,
         })?;
-        let outflow = sats.saturating_add(built.fee_sats);
-        let intent = SpendIntent {
-            outflow_sats: outflow,
-            fee_sats: built.fee_sats,
-            vsize: built.vsize,
-            dest: dest.to_string(),
-            client: self.client.clone(),
-            kind: SpendKind::Send,
-            request_id,
-        };
+        let input_sats = transaction_input_sats(&built.psbt)?;
+        enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
         if !broadcast {
-            let status = self.preview(&intent).await?;
             return Ok(json!({
                 "broadcast": false,
                 "signed": false,
+                "input_sats": input_sats,
                 "fee_sats": built.fee_sats,
                 "feerate_sat_vb": built.feerate_sat_vb,
                 "vsize": built.vsize,
                 "outputs": built.outputs,
-                "cap": status,
                 "psbt": psbt_to_base64(&built.psbt),
                 "used_unconfirmed": built.used_unconfirmed,
             }));
         }
-        let id = match self.reserve(&intent).await? {
-            Reserve::Id(id) => id,
-            Reserve::Replay { txid } => {
-                return Ok(json!({
-                    "broadcast": true,
-                    "replayed": true,
-                    "txid": txid,
-                    "fee_sats": built.fee_sats,
-                }));
-            }
-        };
         let mut psbt = built.psbt;
-        if let Err(err) = sign_psbt(&wallet, &mut psbt) {
-            self.abort(id).await;
-            return Err(err);
-        }
-        let (txid, hex) = match extract_signed(&psbt) {
-            Ok(extracted) => extracted,
-            Err(err) => {
-                self.abort(id).await;
-                return Err(err);
-            }
-        };
-        if let Err(err) = self.commit(id, &txid).await {
-            self.abort(id).await;
-            return Err(err);
-        }
-        self.finish_broadcast(id, &txid, &hex).await?;
+        sign_psbt(&wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        let (txid, hex) = extract_signed(&psbt)?;
+        self.record_spend(
+            &txid,
+            input_sats,
+            &dest.to_string(),
+            built.fee_sats,
+            SpendKind::Send,
+            request_id,
+        )
+        .await;
+        self.broadcast_hex(&hex).await?;
         Ok(json!({
             "broadcast": true,
             "signed": true,
             "txid": txid,
+            "input_sats": input_sats,
             "fee_sats": built.fee_sats,
             "feerate_sat_vb": built.feerate_sat_vb,
             "vsize": built.vsize,
@@ -408,6 +373,8 @@ impl App<'_> {
         let wallet = self.wallet()?;
         wallet.fingerprint_ok(self.config.expected_fingerprint)?;
         let mut psbt = psbt_from_base64(encoded)?;
+        let input_sats = transaction_input_sats(&psbt)?;
+        enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
         let (cache, _, _) = self.discover(&wallet).await?;
         let owned = owned_scripts(&wallet, &cache, &psbt, self.config.max_scan_index)?;
         annotate_owned_inputs(&wallet, &mut psbt, &owned)?;
@@ -417,62 +384,32 @@ impl App<'_> {
             self.config.script,
             self.config.network.bitcoin(),
         )?;
-        let intent = SpendIntent {
-            outflow_sats: inspection.outflow_sats,
-            fee_sats: inspection.fee_sats,
-            vsize: inspection.vsize,
-            dest: inspection.dest.clone(),
-            client: self.client.clone(),
-            kind: SpendKind::Sign,
-            request_id,
-        };
-        let preview = self.preview(&intent).await?;
-        if !preview.allowed {
-            return Err(preview.reason.unwrap_or_else(|| "spend denied".into()));
-        }
-        let id = match self.reserve(&intent).await? {
-            Reserve::Id(id) => id,
-            Reserve::Replay { txid } => {
-                return Ok(json!({
-                    "replayed": true,
-                    "txid": txid,
-                    "broadcast": broadcast,
-                    "cap": preview,
-                }));
-            }
-        };
-        if let Err(err) = sign_psbt(&wallet, &mut psbt) {
-            self.abort(id).await;
-            return Err(err);
-        }
+        sign_psbt(&wallet, &mut psbt, self.config.max_tx_input_sats)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
-        if let Err(err) = self.commit(id, &txid).await {
-            self.abort(id).await;
-            return Err(err);
-        }
+        self.record_spend(
+            &txid,
+            input_sats,
+            &inspection.dest,
+            inspection.fee_sats,
+            SpendKind::Sign,
+            request_id,
+        )
+        .await;
         if broadcast {
             if !inspection.broadcastable_after_sign {
-                self.release(id).await;
                 return Err("psbt is not fully signed".into());
             }
-            let hex = match extract_signed(&psbt) {
-                Ok((_, hex)) => hex,
-                Err(err) => {
-                    self.release(id).await;
-                    return Err(err);
-                }
-            };
-            self.finish_broadcast(id, &txid, &hex).await?;
+            let (_, hex) = extract_signed(&psbt)?;
+            self.broadcast_hex(&hex).await?;
         }
         Ok(json!({
             "broadcast": broadcast,
             "signed": true,
             "txid": txid,
+            "input_sats": input_sats,
             "fee_sats": inspection.fee_sats,
             "vsize": inspection.vsize,
-            "outflow_sats": inspection.outflow_sats,
             "dest": inspection.dest,
-            "cap": preview,
             "psbt": psbt_to_base64(&psbt),
         }))
     }
@@ -600,98 +537,33 @@ impl App<'_> {
         pick_feerate(&estimates, self.config.fee_target_blocks)
     }
 
-    async fn preview(&mut self, intent: &SpendIntent) -> Result<crate::guard::CapStatus, String> {
-        let reply = guard_call(
-            self.ctx,
-            &GuardOp::Apply {
-                command: Command::Preview(intent.clone()),
-                policy: self.config.policy,
-            },
-        )
-        .await?;
-        match reply {
-            GuardReply::Apply {
-                result: ApplyResult::Preview { status },
-            } => Ok(status),
-            GuardReply::Error { message } => Err(message),
-            _ => Err("spend guard returned an unexpected payload".into()),
+    async fn record_spend(
+        &mut self,
+        txid: &str,
+        input_sats: u64,
+        dest: &str,
+        fee_sats: u64,
+        kind: SpendKind,
+        _request_id: Option<String>,
+    ) {
+        let record = SpendRecord {
+            txid: txid.to_string(),
+            input_sats,
+            dest: dest.to_string(),
+            fee_sats,
+            at_ms: Date::now().as_millis(),
+            client: self.client.clone(),
+            kind,
+        };
+        let _ = guard_call(self.ctx, &GuardOp::AppendSpend { record }).await;
+    }
+
+    async fn broadcast_hex(&mut self, hex: &str) -> Result<(), String> {
+        match self.post_broadcast(hex).await {
+            BroadcastVerdict::Accepted => Ok(()),
+            BroadcastVerdict::Rejected { detail } => Err(format!("broadcast rejected: {detail}")),
+            BroadcastVerdict::Unknown { detail } => Err(detail),
         }
-    }
-
-    async fn reserve(&mut self, intent: &SpendIntent) -> Result<Reserve, String> {
-        let reply = guard_call(
-            self.ctx,
-            &GuardOp::Apply {
-                command: Command::Reserve(intent.clone()),
-                policy: self.config.policy,
-            },
-        )
-        .await?;
-        match reply {
-            GuardReply::Apply {
-                result: ApplyResult::Reserved { id, .. },
-            } => Ok(Reserve::Id(id)),
-            GuardReply::Apply {
-                result: ApplyResult::Replay { txid, .. },
-            } => Ok(Reserve::Replay { txid }),
-            GuardReply::Apply {
-                result: ApplyResult::InProgress { .. },
-            } => Err("a spend with this request_id is already in progress".into()),
-            GuardReply::Apply {
-                result: ApplyResult::Denied { status },
-            } => Err(status.reason.unwrap_or_else(|| "spend denied".into())),
-            GuardReply::Apply {
-                result: ApplyResult::Conflict { message },
-            } => Err(message),
-            GuardReply::Error { message } => Err(message),
-            _ => Err("spend guard returned an unexpected payload".into()),
-        }
-    }
-
-    async fn commit(&mut self, id: u64, txid: &str) -> Result<(), String> {
-        let reply = guard_call(
-            self.ctx,
-            &GuardOp::Apply {
-                command: Command::Commit {
-                    id,
-                    txid: txid.to_string(),
-                },
-                policy: self.config.policy,
-            },
-        )
-        .await?;
-        match reply {
-            GuardReply::Apply {
-                result: ApplyResult::Committed { .. },
-            } => Ok(()),
-            GuardReply::Apply {
-                result: ApplyResult::Conflict { message },
-            } => Err(message),
-            GuardReply::Error { message } => Err(message),
-            _ => Err("spend guard returned an unexpected payload".into()),
-        }
-    }
-
-    async fn abort(&mut self, id: u64) {
-        let _ = guard_call(
-            self.ctx,
-            &GuardOp::Apply {
-                command: Command::Abort { id },
-                policy: self.config.policy,
-            },
-        )
-        .await;
-    }
-
-    async fn release(&mut self, id: u64) {
-        let _ = guard_call(
-            self.ctx,
-            &GuardOp::Apply {
-                command: Command::Release { id },
-                policy: self.config.policy,
-            },
-        )
-        .await;
     }
 
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {
@@ -704,35 +576,6 @@ impl App<'_> {
 
     async fn esplora_get(&mut self, path: &str) -> Result<String, String> {
         self.esplora(false, path, None, "application/json").await
-    }
-
-    async fn finish_broadcast(&mut self, id: u64, txid: &str, hex: &str) -> Result<(), String> {
-        let verdict = self.post_broadcast(hex).await;
-        let seen = if release_after_broadcast(&verdict, Some(false)) {
-            self.txid_known(txid).await
-        } else {
-            None
-        };
-        if release_after_broadcast(&verdict, seen) {
-            self.release(id).await;
-            let detail = match &verdict {
-                BroadcastVerdict::Rejected { detail } => detail.clone(),
-                BroadcastVerdict::Accepted | BroadcastVerdict::Unknown { .. } => {
-                    "broadcast was rejected".to_string()
-                }
-            };
-            return Err(format!("broadcast rejected: {detail}"));
-        }
-        match verdict {
-            BroadcastVerdict::Accepted => Ok(()),
-            BroadcastVerdict::Rejected { .. } if seen == Some(true) => Ok(()),
-            BroadcastVerdict::Rejected { .. } => {
-                Err("broadcast outcome is unclear; the spend stays reserved".into())
-            }
-            BroadcastVerdict::Unknown { detail } => {
-                Err(format!("{detail}; the spend stays reserved"))
-            }
-        }
     }
 
     async fn post_broadcast(&mut self, body: &str) -> BroadcastVerdict {
@@ -768,38 +611,6 @@ impl App<'_> {
             }
         }
         fold_broadcast(&attempts)
-    }
-
-    async fn txid_known(&mut self, txid: &str) -> Option<bool> {
-        let mut probes = Vec::new();
-        for backend in self.config.backends.clone() {
-            let bearer = if backend.oauth {
-                match self.oauth_token().await {
-                    Ok(token) => Some(token),
-                    Err(_) => {
-                        probes.push(Presence::Unclear);
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-            let url = format!("{}/tx/{txid}", backend.base.trim_end_matches('/'));
-            let probe = match self
-                .http(false, &url, None, "application/json", bearer.as_deref())
-                .await
-            {
-                Ok((status, _)) if (200..300).contains(&status) => Presence::Found,
-                Ok((404, _)) => Presence::Missing,
-                Ok(_) => Presence::Unclear,
-                Err(_) => Presence::Unclear,
-            };
-            probes.push(probe);
-            if probe == Presence::Found {
-                break;
-            }
-        }
-        fold_presence(&probes)
     }
 
     async fn esplora(
@@ -940,11 +751,6 @@ impl App<'_> {
     }
 }
 
-enum Reserve {
-    Id(u64),
-    Replay { txid: String },
-}
-
 fn coin_from(wallet: &Wallet, chain: ChainKind, index: u32, utxo: Utxo) -> Result<Coin, String> {
     let derived = wallet.derive(chain, index)?;
     Ok(Coin {
@@ -1047,10 +853,7 @@ fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
         max_scan_index: var_string(ctx, "MAX_SCAN_INDEX"),
         max_chain_calls: var_string(ctx, "MAX_CHAIN_CALLS"),
         fee_target_blocks: var_string(ctx, "FEE_TARGET_BLOCKS"),
-        per_tx_cap_sats: var_string(ctx, "PER_TX_CAP_SATS"),
-        rolling_24h_cap_sats: var_string(ctx, "ROLLING_24H_CAP_SATS"),
-        max_feerate_sat_vb: var_string(ctx, "MAX_FEERATE_SAT_VB"),
-        max_fee_sats: var_string(ctx, "MAX_FEE_SATS"),
+        max_tx_input_sats: var_string(ctx, "MAX_TX_INPUT_SATS"),
         esplora_urls: var_string(ctx, "ESPLORA_URLS"),
         expected_fingerprint: var_string(ctx, "EXPECTED_FINGERPRINT"),
         access_team_domain: var_string(ctx, "ACCESS_TEAM_DOMAIN"),
@@ -1223,10 +1026,8 @@ impl DurableObject for SpendGuard {
             }
         };
         let reply_body = match op {
-            GuardOp::Apply { command, policy } => {
-                self.apply_spend(command, policy, Date::now().as_millis())
-                    .await?
-            }
+            GuardOp::AppendSpend { record } => self.append_spend(record).await?,
+            GuardOp::SpendLog { limit } => self.spend_log(limit).await?,
             GuardOp::GetScan => GuardReply::Scan {
                 cache: self.scan().await?,
             },
@@ -1264,28 +1065,30 @@ impl DurableObject for SpendGuard {
 }
 
 impl SpendGuard {
-    async fn apply_spend(
-        &self,
-        command: Command,
-        policy: SpendPolicy,
-        now: u64,
-    ) -> Result<GuardReply> {
-        let slot = Rc::new(RefCell::new(None));
-        let slot_write = slot.clone();
+    async fn append_spend(&self, record: SpendRecord) -> Result<GuardReply> {
+        let now = Date::now().as_millis();
         self.state
             .storage()
             .transaction(move |tx| async move {
-                let state = load_or_default(&tx, "spend").await?;
-                let (state, result) = crate::guard::apply(state, command, now, &policy);
-                tx.put("spend", state).await?;
-                *slot_write.borrow_mut() = Some(result);
+                let mut log: crate::guard::SpendLog = load_or_default(&tx, "spend").await?;
+                log.append(record, now);
+                tx.put("spend", log).await?;
                 Ok(())
             })
             .await?;
-        let result = slot.borrow_mut().take().ok_or_else(|| {
-            worker::Error::from("spend guard did not return a result".to_string())
-        })?;
-        Ok(GuardReply::Apply { result })
+        Ok(GuardReply::Appended)
+    }
+
+    async fn spend_log(&self, limit: u32) -> Result<GuardReply> {
+        let log = self
+            .state
+            .storage()
+            .get::<crate::guard::SpendLog>("spend")
+            .await?
+            .unwrap_or_default();
+        Ok(GuardReply::Log {
+            spends: log.recent(limit),
+        })
     }
 
     async fn merge(&self, external: Vec<u32>, change: Vec<u32>) -> Result<GuardReply> {

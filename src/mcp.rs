@@ -130,7 +130,7 @@ fn initialize_result(id: &Value, params: Option<&Value>) -> Value {
             "protocolVersion": version,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "satchel", "title": "Satchel", "version": "0.1.0" },
-            "instructions": "Satchel is a hot Bitcoin wallet. send and sign_psbt default to a dry run. Set broadcast to true only when funds should move. Amounts are satoshis. Caps are enforced by the worker."
+            "instructions": "Satchel is a hot Bitcoin wallet. send and sign_psbt default to a dry run. Set broadcast to true only when funds should move. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS."
         }),
     )
 }
@@ -318,7 +318,7 @@ fn tool_specs() -> Vec<Value> {
                 "request_id": { "type": "string" }
             }
         })),
-        tool("sign_psbt", "Sign a base64 PSBT. A returned signature counts against the cap. Broadcast only when broadcast is true.", json!({
+        tool("sign_psbt", "Sign a base64 PSBT. Every input must have a known value, and the input sum must be within MAX_TX_INPUT_SATS. Broadcast only when broadcast is true.", json!({
             "type": "object",
             "required": ["psbt"],
             "properties": {
@@ -327,7 +327,7 @@ fn tool_specs() -> Vec<Value> {
                 "request_id": { "type": "string" }
             }
         })),
-        tool("spend_log", "Recent capped spends. No secrets.", json!({
+        tool("spend_log", "Recent signed transactions. No secrets.", json!({
             "type": "object",
             "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 200 } }
         })),

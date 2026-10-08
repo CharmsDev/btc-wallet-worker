@@ -1,5 +1,4 @@
 use crate::esplora::{plan_backends, Backend};
-use crate::policy::SpendPolicy;
 use crate::wallet::{parse_fingerprint, NetworkKind, ScriptKind};
 use bitcoin::bip32::Fingerprint;
 
@@ -28,7 +27,7 @@ pub struct Config {
     pub max_scan_index: u32,
     pub max_chain_calls: u32,
     pub fee_target_blocks: u32,
-    pub policy: SpendPolicy,
+    pub max_tx_input_sats: u64,
     pub expected_fingerprint: Option<Fingerprint>,
     pub backends: Vec<Backend>,
     pub access: Option<AccessSpec>,
@@ -43,10 +42,7 @@ pub struct RawConfig {
     pub max_scan_index: String,
     pub max_chain_calls: String,
     pub fee_target_blocks: String,
-    pub per_tx_cap_sats: String,
-    pub rolling_24h_cap_sats: String,
-    pub max_feerate_sat_vb: String,
-    pub max_fee_sats: String,
+    pub max_tx_input_sats: String,
     pub esplora_urls: String,
     pub expected_fingerprint: String,
     pub access_team_domain: String,
@@ -83,18 +79,9 @@ impl Config {
             1008,
             "FEE_TARGET_BLOCKS",
         )?;
-        let policy = SpendPolicy {
-            per_tx_cap_sats: parse_u64(&raw.per_tx_cap_sats, 100_000, "PER_TX_CAP_SATS")?,
-            rolling_24h_cap_sats: parse_u64(
-                &raw.rolling_24h_cap_sats,
-                250_000,
-                "ROLLING_24H_CAP_SATS",
-            )?,
-            max_feerate_sat_vb: parse_u64(&raw.max_feerate_sat_vb, 200, "MAX_FEERATE_SAT_VB")?,
-            max_fee_sats: parse_u64(&raw.max_fee_sats, 20_000, "MAX_FEE_SATS")?,
-        };
-        if policy.per_tx_cap_sats > policy.rolling_24h_cap_sats {
-            return Err("PER_TX_CAP_SATS cannot exceed ROLLING_24H_CAP_SATS".into());
+        let max_tx_input_sats = parse_u64(&raw.max_tx_input_sats, 100_000, "MAX_TX_INPUT_SATS")?;
+        if max_tx_input_sats == 0 {
+            return Err("MAX_TX_INPUT_SATS must be greater than zero".into());
         }
         let expected_fingerprint = if raw.expected_fingerprint.trim().is_empty() {
             None
@@ -111,7 +98,7 @@ impl Config {
             max_scan_index,
             max_chain_calls,
             fee_target_blocks,
-            policy,
+            max_tx_input_sats,
             expected_fingerprint,
             backends,
             access,
@@ -166,15 +153,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_mainnet_bip84_with_the_published_caps() {
+    fn defaults_are_mainnet_bip84_with_the_input_cap() {
         let config = Config::from_raw(&RawConfig::default()).unwrap();
         assert_eq!(config.network, NetworkKind::Mainnet);
         assert_eq!(config.script, ScriptKind::Bip84);
         assert_eq!(config.gap_limit, 20);
-        assert_eq!(config.policy.per_tx_cap_sats, 100_000);
-        assert_eq!(config.policy.rolling_24h_cap_sats, 250_000);
-        assert_eq!(config.policy.max_feerate_sat_vb, 200);
-        assert_eq!(config.policy.max_fee_sats, 20_000);
+        assert_eq!(config.max_tx_input_sats, 100_000);
         assert!(config.expected_fingerprint.is_none());
         assert!(config.access.is_none());
         assert_eq!(config.backends.len(), 2);
