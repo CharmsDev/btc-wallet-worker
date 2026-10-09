@@ -53,6 +53,7 @@ Vars live in `wrangler.toml`. Secrets are set with `wrangler secret put` and are
 | `MAX_CHAIN_CALLS` | var | `80` | Esplora calls allowed in one tool call |
 | `FEE_TARGET_BLOCKS` | var | `3` | Confirmation target when `feerate` is omitted |
 | `MAX_TX_INPUT_SATS` | var | `100000` | Max sum of all input values in one transaction |
+| `IDEMPOTENCY_TTL_HOURS` | var | `168` | Hours a `request_id` keeps its signed transaction. Must be 24 to 168. A value outside that range is a config error |
 | `ESPLORA_URLS` | var | empty | Comma-separated Esplora bases. Empty uses the defaults below |
 | `EXPECTED_FINGERPRINT` | var | empty | 8 hex characters. When set, signing is refused if the seed does not match |
 | `ACCESS_TEAM_DOMAIN` | var | empty | Team name or `team.cloudflareaccess.com`. Set with `ACCESS_AUD` |
@@ -83,6 +84,16 @@ The endpoint is `POST /mcp`. The body is one JSON-RPC 2.0 message. The server is
 Tools: `balance`, `address`, `history`, `utxos`, `fee_estimates`, `descriptor`, `send`, `sign_psbt`, `spend_log`.
 
 `send` and `sign_psbt` default to `broadcast: false`. `send` then returns the fee, vsize, outputs, input sum, and an unsigned PSBT. It signs and broadcasts only when `broadcast` is `true`. `sign_psbt` signs only when every input has a known value and the input sum is within `MAX_TX_INPUT_SATS`. `broadcast: true` on `sign_psbt` also submits the transaction.
+
+Every call that signs needs a `request_id`. That is `send` with `broadcast: true`, and every `sign_psbt` call. A `request_id` is 1 to 80 letters, digits, or `.` `_` `:` `-`. Use a new one for each payment. A dry-run `send` checks the format of a `request_id` and then ignores it.
+
+To retry after an error or a lost reply, send the same arguments with the same `request_id`. Satchel returns the stored result. If no broadcast of the stored transaction was confirmed, it broadcasts that same transaction again. A retry does not select coins or sign a second time. For `sign_psbt`, the arguments that count are the unsigned transaction and `broadcast`.
+
+- The same `request_id` with different arguments is an error.
+- A retry that arrives while the first call is still signing gets an in-progress error. Wait and retry with the same arguments.
+- Keys belong to one client name. Two clients can use the same `request_id` without a conflict.
+- A key expires after `IDEMPOTENCY_TTL_HOURS`. After that, the same `request_id` starts a new payment.
+- The store holds at most 512 live keys. When it is full, it refuses a new key until old keys expire. It never drops a stored transaction to make room.
 
 Cursor (`~/.cursor/mcp.json`):
 
@@ -138,7 +149,9 @@ The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every 
 
 Signing allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected.
 
-The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction. The worker retries a failed log write once. Each signing call gets its own random log id, and the retry reuses that id, so a lost success does not add a second row and a second call in the same millisecond stays in the log. If it still fails, the signature is returned and the response includes `spend_log_warning`.
+The Durable Object stores the signed transaction for each `request_id`, so a retry can return it or broadcast it again. It does not approve or refuse an amount.
+
+The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, `request_id`, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped. The log does not block a second transaction. The row is written in the same Durable Object transaction that stores the signed transaction for the `request_id`, so a retry with the same key does not add a second row. If that transaction fails, nothing is broadcast.
 
 Discovery probes every issued receive index before it counts the unused gap, so a deposit to an address from `address` stays visible when earlier indexes are unused. It also probes the gap past the last used index. Raise `MAX_CHAIN_CALLS` if a busy wallet hits the per-call budget. Workers still have a platform subrequest limit. 80 calls fits a paid Worker with room for the Access JWKS and token requests.
 

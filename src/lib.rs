@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod esplora;
 mod guard;
+mod idempotency;
 mod mcp;
 mod policy;
 mod scan;

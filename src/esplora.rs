@@ -637,4 +637,20 @@ mod tests {
         ]);
         assert!(matches!(verdict, BroadcastVerdict::Unknown { .. }));
     }
+
+    #[test]
+    fn a_transaction_the_backend_already_has_is_accepted() {
+        for body in [
+            "txn-already-in-mempool",
+            "Transaction already in block chain",
+        ] {
+            assert_eq!(
+                fold_broadcast(&[RawAttempt::Http {
+                    status: 400,
+                    body: body.into(),
+                }]),
+                BroadcastVerdict::Accepted
+            );
+        }
+    }
 }

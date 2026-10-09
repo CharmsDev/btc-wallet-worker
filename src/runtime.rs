@@ -6,21 +6,25 @@ use crate::esplora::{
     AddressStats, AttemptClass, BroadcastVerdict, RawAttempt, Utxo,
 };
 use crate::guard::{
-    attach_log_warning, join_log_warning, merge_scan, take_receive, unlogged_spend_warning,
-    GuardOp, GuardReply, OauthCache, SpendKind, SpendRecord,
+    merge_scan, take_receive, GuardOp, GuardReply, OauthCache, SpendKind, SpendLog,
 };
-use crate::mcp::{self, Incoming, ToolCall};
+use crate::idempotency::{
+    apply, body_key, client_message, Artifact, Body, Canon, Decision, Index, Op, RequestId, Slot,
+    SpendFacts, WalletStamp, INDEX_KEY,
+};
+use crate::mcp::{self, Incoming, SendMode, ToolCall};
 use crate::policy::enforce_input_cap;
 use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
     annotate_owned_inputs, build_payment, extract_signed, indexes_from_origins, inspect_psbt,
-    psbt_from_base64, psbt_to_base64, sign_psbt, transaction_input_sats, Coin, Payment,
+    psbt_from_base64, psbt_to_base64, sign_psbt, transaction_input_sats, Built, Coin, Payment,
 };
 use crate::wallet::{parse_address, ChainKind, Wallet};
+use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::ScriptBuf;
+use bitcoin::{Address, ScriptBuf};
 use serde_json::{json, Value};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use worker::*;
@@ -35,7 +39,6 @@ struct JwksCache {
 
 thread_local! {
     static JWKS: RefCell<Option<JwksCache>> = const { RefCell::new(None) };
-    static LOG_SEQ: Cell<u64> = const { Cell::new(0) };
 }
 
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -103,6 +106,18 @@ struct App<'a> {
     calls: u32,
 }
 
+enum Effect {
+    Send {
+        dest: Address,
+        sats: u64,
+        feerate: Option<u64>,
+    },
+    Sign {
+        psbt: Psbt,
+        broadcast: bool,
+    },
+}
+
 impl App<'_> {
     async fn dispatch(&mut self, call: ToolCall) -> Result<Value, String> {
         match call {
@@ -116,9 +131,8 @@ impl App<'_> {
                 to,
                 sats,
                 feerate,
-                broadcast,
-                request_id,
-            } => self.send(&to, sats, feerate, broadcast, request_id).await,
+                mode,
+            } => self.send(&to, sats, feerate, mode).await,
             ToolCall::SignPsbt {
                 psbt,
                 broadcast,
@@ -310,26 +324,185 @@ impl App<'_> {
         to: &str,
         sats: u64,
         feerate: Option<u64>,
-        broadcast: bool,
-        request_id: Option<String>,
+        mode: SendMode,
     ) -> Result<Value, String> {
         let wallet = self.wallet()?;
-        if broadcast {
-            wallet.fingerprint_ok(self.config.expected_fingerprint)?;
-        }
+        let request_id = match mode {
+            SendMode::DryRun => return self.dry_run(&wallet, to, sats, feerate).await,
+            SendMode::Broadcast { request_id } => request_id,
+        };
+        wallet.fingerprint_ok(self.config.expected_fingerprint)?;
         let dest = parse_address(to, self.config.network)?;
-        let coins = self.collect_utxos(&wallet).await?;
+        let hash = Canon::send(
+            &WalletStamp::of(&wallet),
+            dest.script_pubkey().as_bytes(),
+            sats,
+            feerate,
+        );
+        let effect = Effect::Send {
+            dest,
+            sats,
+            feerate,
+        };
+        self.effect(&wallet, request_id, hash, effect).await
+    }
+
+    async fn dry_run(
+        &mut self,
+        wallet: &Wallet,
+        to: &str,
+        sats: u64,
+        feerate: Option<u64>,
+    ) -> Result<Value, String> {
+        let dest = parse_address(to, self.config.network)?;
+        let (built, input_sats) = self.build_send(wallet, &dest, sats, feerate).await?;
+        Ok(json!({
+            "broadcast": false,
+            "signed": false,
+            "input_sats": input_sats,
+            "fee_sats": built.fee_sats,
+            "feerate_sat_vb": built.feerate_sat_vb,
+            "vsize": built.vsize,
+            "outputs": built.outputs,
+            "psbt": psbt_to_base64(&built.psbt),
+            "used_unconfirmed": built.used_unconfirmed,
+        }))
+    }
+
+    async fn sign_psbt(
+        &mut self,
+        encoded: &str,
+        broadcast: bool,
+        request_id: RequestId,
+    ) -> Result<Value, String> {
+        let wallet = self.wallet()?;
+        wallet.fingerprint_ok(self.config.expected_fingerprint)?;
+        let psbt = psbt_from_base64(encoded)?;
+        let hash = Canon::sign(
+            &WalletStamp::of(&wallet),
+            psbt.unsigned_tx.compute_txid().to_byte_array(),
+            broadcast,
+        );
+        let effect = Effect::Sign { psbt, broadcast };
+        self.effect(&wallet, request_id, hash, effect).await
+    }
+
+    /// Begin runs before any Esplora call, so a repeated or concurrent call with
+    /// the same request_id cannot select coins or sign a second transaction.
+    async fn effect(
+        &mut self,
+        wallet: &Wallet,
+        request_id: RequestId,
+        hash: Canon,
+        effect: Effect,
+    ) -> Result<Value, String> {
+        let slot = Slot::new(&self.client, request_id);
+        let begin = Op::Begin {
+            slot: slot.clone(),
+            hash,
+            ttl_ms: self.config.idempotency_ttl_ms,
+        };
+        let generation = match self.idempotency(begin).await? {
+            Decision::Proceed { generation } => generation,
+            settled => return self.settle(&slot, settled).await,
+        };
+        let signed = match effect {
+            Effect::Send {
+                dest,
+                sats,
+                feerate,
+            } => self.sign_send(wallet, &dest, sats, feerate).await,
+            Effect::Sign { psbt, broadcast } => self.sign_foreign(wallet, psbt, broadcast).await,
+        };
+        let artifact = match signed {
+            Ok(artifact) => artifact,
+            Err(err) => {
+                // A lost abort leaves the claim to lapse after CLAIM_LEASE_MS.
+                let _ = self.idempotency(Op::Abort { slot, generation }).await;
+                return Err(err);
+            }
+        };
+        let committed = match self
+            .idempotency(Op::Commit {
+                slot: slot.clone(),
+                generation,
+                hash,
+                artifact,
+            })
+            .await
+        {
+            Ok(decision) => decision,
+            Err(err) => {
+                // Abort leaves a stored transaction in place. A lost commit
+                // reply therefore stays pinned, and a commit that never landed
+                // releases the claim so the retry does not wait out the lease.
+                let _ = self.idempotency(Op::Abort { slot, generation }).await;
+                return Err(err);
+            }
+        };
+        self.settle(&slot, committed).await
+    }
+
+    async fn settle(&mut self, slot: &Slot, decision: Decision) -> Result<Value, String> {
+        match decision {
+            Decision::Return { response } => Ok(response),
+            Decision::Rebroadcast {
+                generation,
+                txid,
+                raw_tx_hex,
+                response,
+            } => {
+                let request_id = slot.request_id();
+                match self.post_broadcast(&raw_tx_hex).await {
+                    BroadcastVerdict::Accepted => {
+                        // If this note is lost, the next retry rebroadcasts and the
+                        // backend reports the transaction as already known.
+                        let _ = self
+                            .idempotency(Op::NoteAccepted {
+                                slot: slot.clone(),
+                                generation,
+                            })
+                            .await;
+                        Ok(response)
+                    }
+                    BroadcastVerdict::Rejected { detail } => Err(format!(
+                        "broadcast rejected: {detail}. txid {txid} is stored for request_id {request_id}. Retry the same arguments with the same request_id to broadcast it again"
+                    )),
+                    BroadcastVerdict::Unknown { detail } => Err(format!(
+                        "broadcast outcome unknown: {detail}. txid {txid} is stored for request_id {request_id}. Retry the same arguments with the same request_id to broadcast it again"
+                    )),
+                }
+            }
+            Decision::Proceed { .. }
+            | Decision::InProgress
+            | Decision::Mismatch { .. }
+            | Decision::StorageFull
+            | Decision::TooLarge
+            | Decision::Missing
+            | Decision::Stale
+            | Decision::Cleared => Err(client_message(&decision, slot.request_id())),
+        }
+    }
+
+    async fn build_send(
+        &mut self,
+        wallet: &Wallet,
+        dest: &Address,
+        sats: u64,
+        feerate: Option<u64>,
+    ) -> Result<(Built, u64), String> {
+        let coins = self.collect_utxos(wallet).await?;
         let feerate = match feerate {
             Some(rate) => rate,
             None => self.chosen_feerate().await?,
         };
-        let change_index = self.next_change(&wallet).await?;
+        let change_index = self.next_change(wallet).await?;
         let change = wallet.derive(ChainKind::Change, change_index)?.address;
         let built = build_payment(&Payment {
             script: self.config.script,
             fingerprint: wallet.fingerprint(),
             coins: &coins,
-            dest: &dest,
+            dest,
             amount: sats,
             feerate,
             change: &change,
@@ -337,105 +510,104 @@ impl App<'_> {
         })?;
         let input_sats = transaction_input_sats(&built.psbt)?;
         enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
-        if !broadcast {
-            return Ok(json!({
-                "broadcast": false,
-                "signed": false,
-                "input_sats": input_sats,
-                "fee_sats": built.fee_sats,
-                "feerate_sat_vb": built.feerate_sat_vb,
-                "vsize": built.vsize,
-                "outputs": built.outputs,
-                "psbt": psbt_to_base64(&built.psbt),
-                "used_unconfirmed": built.used_unconfirmed,
-            }));
-        }
-        let mut psbt = built.psbt;
-        sign_psbt(&wallet, &mut psbt, self.config.max_tx_input_sats)?;
-        let (txid, hex) = extract_signed(&psbt)?;
-        let warning = self
-            .record_spend(
-                &txid,
-                input_sats,
-                &dest.to_string(),
-                built.fee_sats,
-                SpendKind::Send,
-                request_id,
-            )
-            .await;
-        if let Err(err) = self.broadcast_hex(&hex).await {
-            return Err(join_log_warning(&err, warning));
-        }
-        Ok(attach_log_warning(
-            json!({
-                "broadcast": true,
-                "signed": true,
-                "txid": txid,
-                "input_sats": input_sats,
-                "fee_sats": built.fee_sats,
-                "feerate_sat_vb": built.feerate_sat_vb,
-                "vsize": built.vsize,
-                "outputs": built.outputs,
-                "used_unconfirmed": built.used_unconfirmed,
-            }),
-            warning,
-        ))
+        Ok((built, input_sats))
     }
 
-    async fn sign_psbt(
+    async fn sign_send(
         &mut self,
-        encoded: &str,
+        wallet: &Wallet,
+        dest: &Address,
+        sats: u64,
+        feerate: Option<u64>,
+    ) -> Result<Artifact, String> {
+        let (built, input_sats) = self.build_send(wallet, dest, sats, feerate).await?;
+        let mut psbt = built.psbt;
+        sign_psbt(wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        let (txid, raw_tx_hex) = extract_signed(&psbt)?;
+        let response = json!({
+            "broadcast": true,
+            "signed": true,
+            "txid": txid,
+            "input_sats": input_sats,
+            "fee_sats": built.fee_sats,
+            "feerate_sat_vb": built.feerate_sat_vb,
+            "vsize": built.vsize,
+            "outputs": built.outputs,
+            "used_unconfirmed": built.used_unconfirmed,
+        });
+        Ok(Artifact::Broadcast {
+            raw_tx_hex,
+            response,
+            txid,
+            facts: SpendFacts {
+                kind: SpendKind::Send,
+                input_sats,
+                dest: dest.to_string(),
+                fee_sats: built.fee_sats,
+            },
+        })
+    }
+
+    async fn sign_foreign(
+        &mut self,
+        wallet: &Wallet,
+        mut psbt: Psbt,
         broadcast: bool,
-        request_id: Option<String>,
-    ) -> Result<Value, String> {
-        let wallet = self.wallet()?;
-        wallet.fingerprint_ok(self.config.expected_fingerprint)?;
-        let mut psbt = psbt_from_base64(encoded)?;
+    ) -> Result<Artifact, String> {
         let input_sats = transaction_input_sats(&psbt)?;
         enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
-        let (cache, _, _) = self.discover(&wallet).await?;
-        let owned = owned_scripts(&wallet, &cache, &psbt, self.config.max_scan_index)?;
-        annotate_owned_inputs(&wallet, &mut psbt, &owned)?;
+        let (cache, _, _) = self.discover(wallet).await?;
+        let owned = owned_scripts(wallet, &cache, &psbt, self.config.max_scan_index)?;
+        annotate_owned_inputs(wallet, &mut psbt, &owned)?;
         let inspection = inspect_psbt(
             &psbt,
             &owned,
             self.config.script,
             self.config.network.bitcoin(),
         )?;
-        sign_psbt(&wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        sign_psbt(wallet, &mut psbt, self.config.max_tx_input_sats)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
-        let warning = self
-            .record_spend(
-                &txid,
-                input_sats,
-                &inspection.dest,
-                inspection.fee_sats,
-                SpendKind::Sign,
-                request_id,
-            )
-            .await;
-        if broadcast {
-            if !inspection.broadcastable_after_sign {
-                return Err(join_log_warning("psbt is not fully signed", warning));
-            }
-            let (_, hex) = extract_signed(&psbt)?;
-            if let Err(err) = self.broadcast_hex(&hex).await {
-                return Err(join_log_warning(&err, warning));
-            }
+        let response = json!({
+            "broadcast": broadcast,
+            "signed": true,
+            "txid": txid,
+            "input_sats": input_sats,
+            "fee_sats": inspection.fee_sats,
+            "vsize": inspection.vsize,
+            "dest": inspection.dest,
+            "psbt": psbt_to_base64(&psbt),
+        });
+        let facts = SpendFacts {
+            kind: SpendKind::Sign,
+            input_sats,
+            dest: inspection.dest,
+            fee_sats: inspection.fee_sats,
+        };
+        if !broadcast {
+            return Ok(Artifact::SignedOnly {
+                response,
+                txid,
+                facts,
+            });
         }
-        Ok(attach_log_warning(
-            json!({
-                "broadcast": broadcast,
-                "signed": true,
-                "txid": txid,
-                "input_sats": input_sats,
-                "fee_sats": inspection.fee_sats,
-                "vsize": inspection.vsize,
-                "dest": inspection.dest,
-                "psbt": psbt_to_base64(&psbt),
-            }),
-            warning,
-        ))
+        if !inspection.broadcastable_after_sign {
+            return Err("psbt is not fully signed".into());
+        }
+        let (_, raw_tx_hex) = extract_signed(&psbt)?;
+        Ok(Artifact::Broadcast {
+            raw_tx_hex,
+            response,
+            txid,
+            facts,
+        })
+    }
+
+    async fn idempotency(&self, call: Op) -> Result<Decision, String> {
+        match guard_call(self.ctx, &GuardOp::Idempotency { call }).await? {
+            GuardReply::Idempotency { decision } => Ok(decision),
+            GuardReply::Error { message } => Err(message),
+            _ => Err("spend guard returned an unexpected payload".into()),
+        }
     }
 
     async fn discover(
@@ -567,52 +739,6 @@ impl App<'_> {
         let body = self.esplora_get("/fee-estimates").await?;
         let estimates = parse_fee_estimates(&body)?;
         pick_feerate(&estimates, self.config.fee_target_blocks)
-    }
-
-    async fn record_spend(
-        &mut self,
-        txid: &str,
-        input_sats: u64,
-        dest: &str,
-        fee_sats: u64,
-        kind: SpendKind,
-        _request_id: Option<String>,
-    ) -> Option<String> {
-        let record = SpendRecord {
-            txid: txid.to_string(),
-            input_sats,
-            dest: dest.to_string(),
-            fee_sats,
-            at_ms: Date::now().as_millis(),
-            client: self.client.clone(),
-            kind,
-            id: fresh_log_id(),
-        };
-        let mut detail = "spend guard unavailable".to_string();
-        for _ in 0..2 {
-            match guard_call(
-                self.ctx,
-                &GuardOp::AppendSpend {
-                    record: record.clone(),
-                },
-            )
-            .await
-            {
-                Ok(GuardReply::Appended) => return None,
-                Ok(GuardReply::Error { message }) => detail = message,
-                Err(message) => detail = message,
-                Ok(_) => detail = "spend guard returned an unexpected payload".into(),
-            }
-        }
-        Some(unlogged_spend_warning(&detail))
-    }
-
-    async fn broadcast_hex(&mut self, hex: &str) -> Result<(), String> {
-        match self.post_broadcast(hex).await {
-            BroadcastVerdict::Accepted => Ok(()),
-            BroadcastVerdict::Rejected { detail } => Err(format!("broadcast rejected: {detail}")),
-            BroadcastVerdict::Unknown { detail } => Err(detail),
-        }
     }
 
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {
@@ -850,20 +976,6 @@ fn owned_scripts(
     Ok(owned)
 }
 
-fn fresh_log_id() -> String {
-    let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        let tick = Date::now().as_millis();
-        bytes[..8].copy_from_slice(&tick.to_le_bytes());
-        LOG_SEQ.with(|seq| {
-            let next = seq.get().wrapping_add(1);
-            seq.set(next);
-            bytes[8..16].copy_from_slice(&next.to_le_bytes());
-        });
-    }
-    hex::encode(bytes)
-}
-
 fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
     let raw = RawConfig {
         network: var_string(ctx, "NETWORK"),
@@ -874,6 +986,7 @@ fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
         max_chain_calls: var_string(ctx, "MAX_CHAIN_CALLS"),
         fee_target_blocks: var_string(ctx, "FEE_TARGET_BLOCKS"),
         max_tx_input_sats: var_string(ctx, "MAX_TX_INPUT_SATS"),
+        idempotency_ttl_hours: var_string(ctx, "IDEMPOTENCY_TTL_HOURS"),
         esplora_urls: var_string(ctx, "ESPLORA_URLS"),
         expected_fingerprint: var_string(ctx, "EXPECTED_FINGERPRINT"),
         access_team_domain: var_string(ctx, "ACCESS_TEAM_DOMAIN"),
@@ -1046,7 +1159,7 @@ impl DurableObject for SpendGuard {
             }
         };
         let reply_body = match op {
-            GuardOp::AppendSpend { record } => self.append_spend(record).await?,
+            GuardOp::Idempotency { call } => self.idempotency(call).await?,
             GuardOp::SpendLog { limit } => self.spend_log(limit).await?,
             GuardOp::GetScan => GuardReply::Scan {
                 cache: self.scan().await?,
@@ -1089,25 +1202,47 @@ impl DurableObject for SpendGuard {
 }
 
 impl SpendGuard {
-    async fn append_spend(&self, record: SpendRecord) -> Result<GuardReply> {
+    async fn idempotency(&self, op: Op) -> Result<GuardReply> {
         let now = Date::now().as_millis();
+        let decided = Rc::new(RefCell::new(None));
+        let decided_write = decided.clone();
         self.state
             .storage()
             .transaction(move |tx| async move {
-                let mut log: crate::guard::SpendLog = load_or_default(&tx, "spend").await?;
-                log.append(record, now);
-                tx.put("spend", log).await?;
+                let mut index: Index = load_or_default(&tx, INDEX_KEY).await?;
+                let loaded = match index.stored_body_id(op.slot()) {
+                    Some(id) => load_optional::<Body>(&tx, &body_key(id)).await?,
+                    None => None,
+                };
+                let outcome = apply(&mut index, loaded.as_ref(), now, op);
+                if let Some(draft) = outcome.spend {
+                    let mut log: SpendLog = load_or_default(&tx, "spend").await?;
+                    log.append(draft.into_record(now), now);
+                    tx.put("spend", log).await?;
+                }
+                if let Some((id, body)) = &outcome.put_body {
+                    tx.put(&body_key(*id), body).await?;
+                }
+                for id in &outcome.delete_body_ids {
+                    tx.delete(&body_key(*id)).await?;
+                }
+                tx.put(INDEX_KEY, &index).await?;
+                *decided_write.borrow_mut() = Some(outcome.decision);
                 Ok(())
             })
             .await?;
-        Ok(GuardReply::Appended)
+        let decision = decided
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| worker::Error::from("idempotency step failed".to_string()))?;
+        Ok(GuardReply::Idempotency { decision })
     }
 
     async fn spend_log(&self, limit: u32) -> Result<GuardReply> {
         let log = self
             .state
             .storage()
-            .get::<crate::guard::SpendLog>("spend")
+            .get::<SpendLog>("spend")
             .await?
             .unwrap_or_default();
         Ok(GuardReply::Log {
@@ -1178,11 +1313,18 @@ impl SpendGuard {
 
 async fn load_or_default<T>(tx: &worker::durable::Transaction, key: &str) -> Result<T>
 where
-    T: Default + serde::de::DeserializeOwned + serde::Serialize,
+    T: Default + serde::de::DeserializeOwned,
+{
+    Ok(load_optional(tx, key).await?.unwrap_or_default())
+}
+
+async fn load_optional<T>(tx: &worker::durable::Transaction, key: &str) -> Result<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
 {
     match tx.get::<T>(key).await {
-        Ok(value) => Ok(value),
-        Err(err) if err.to_string().contains("No such value") => Ok(T::default()),
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.to_string().contains("No such value") => Ok(None),
         Err(err) => Err(err),
     }
 }
