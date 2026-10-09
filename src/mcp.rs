@@ -1,7 +1,14 @@
+use crate::idempotency::RequestId;
 use serde_json::{json, Value};
 
 pub const PROTOCOL: &str = "2025-06-18";
 const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SendMode {
+    DryRun,
+    Broadcast { request_id: RequestId },
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToolCall {
@@ -19,13 +26,12 @@ pub enum ToolCall {
         to: String,
         sats: u64,
         feerate: Option<u64>,
-        broadcast: bool,
-        request_id: Option<String>,
+        mode: SendMode,
     },
     SignPsbt {
         psbt: String,
         broadcast: bool,
-        request_id: Option<String>,
+        request_id: RequestId,
     },
     SpendLog {
         limit: u32,
@@ -130,7 +136,7 @@ fn initialize_result(id: &Value, params: Option<&Value>) -> Value {
             "protocolVersion": version,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "satchel", "title": "Satchel", "version": "0.1.0" },
-            "instructions": "Satchel is a hot Bitcoin wallet. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt always signs, even when broadcast is false, and the returned PSBT can be broadcast elsewhere. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS."
+            "instructions": "Satchel is a hot Bitcoin wallet. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt always signs, even when broadcast is false, and the returned PSBT can be broadcast elsewhere. Every call that signs needs a request_id. That is send with broadcast true, and every sign_psbt call. Use a new request_id for each new payment. To retry after an error or a lost reply, call again with the same arguments and the same request_id. Satchel then returns the stored result or rebroadcasts the same transaction, and it does not sign a second one. The same request_id with different arguments is an error. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS."
         }),
     )
 }
@@ -163,13 +169,12 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
             to: string_arg(&args, "to")?,
             sats: required_u64(&args, "sats")?,
             feerate: optional_feerate(&args)?,
-            broadcast: bool_arg(&args, "broadcast", false)?,
-            request_id: optional_request_id(&args)?,
+            mode: send_mode(&args)?,
         }),
         "sign_psbt" => Ok(ToolCall::SignPsbt {
             psbt: string_arg(&args, "psbt")?,
             broadcast: bool_arg(&args, "broadcast", false)?,
-            request_id: optional_request_id(&args)?,
+            request_id: required_request_id(&args, "request_id is required for sign_psbt")?,
         }),
         "spend_log" => Ok(ToolCall::SpendLog {
             limit: u32_arg(&args, "limit", 50, 1, 200)?,
@@ -247,25 +252,25 @@ fn optional_feerate(args: &Value) -> Result<Option<u64>, String> {
     }
 }
 
-fn optional_request_id(args: &Value) -> Result<Option<String>, String> {
+fn send_mode(args: &Value) -> Result<SendMode, String> {
+    if !bool_arg(args, "broadcast", false)? {
+        optional_request_id(args)?;
+        return Ok(SendMode::DryRun);
+    }
+    Ok(SendMode::Broadcast {
+        request_id: required_request_id(args, "request_id is required when broadcast is true")?,
+    })
+}
+
+fn required_request_id(args: &Value, missing: &str) -> Result<RequestId, String> {
+    optional_request_id(args)?.ok_or_else(|| missing.to_string())
+}
+
+fn optional_request_id(args: &Value) -> Result<Option<RequestId>, String> {
     match args.get("request_id") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => {
-            let value = value.trim();
-            if value.is_empty() {
-                return Ok(None);
-            }
-            if value.len() > 80
-                || !value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._:-".contains(c))
-            {
-                return Err(
-                    "request_id must be 1-80 characters of letters, digits, or . _ : -".into(),
-                );
-            }
-            Ok(Some(value.to_string()))
-        }
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => RequestId::parse(value).map(Some),
         _ => Err("request_id must be a string".into()),
     }
 }
@@ -307,7 +312,7 @@ fn tool_specs() -> Vec<Value> {
         tool("utxos", "Unspent outputs known to the wallet.", json!({ "type": "object", "properties": {} })),
         tool("fee_estimates", "Esplora fee estimates in sat/vB.", json!({ "type": "object", "properties": {} })),
         tool("descriptor", "Public account descriptors and the master fingerprint.", json!({ "type": "object", "properties": {} })),
-        tool("send", "Build a payment. Dry-run unless broadcast is true.", json!({
+        tool("send", "Build a payment. Dry-run unless broadcast is true. With broadcast true it signs and broadcasts, and request_id is required. To retry, send the same arguments with the same request_id. Satchel returns the stored result or rebroadcasts the same transaction, and it does not sign a second one.", json!({
             "type": "object",
             "required": ["to", "sats"],
             "properties": {
@@ -315,16 +320,22 @@ fn tool_specs() -> Vec<Value> {
                 "sats": { "type": "integer", "minimum": 1 },
                 "feerate": { "type": "number" },
                 "broadcast": { "type": "boolean" },
-                "request_id": { "type": "string" }
+                "request_id": {
+                    "type": "string",
+                    "description": "Required when broadcast is true. Use one per payment, 1-80 letters, digits, or . _ : -. Reuse it only to retry the same arguments. Ignored on a dry run."
+                }
             }
         })),
-        tool("sign_psbt", "Sign a base64 PSBT. Every input must have a known value, and the input sum must be within MAX_TX_INPUT_SATS. Broadcast only when broadcast is true.", json!({
+        tool("sign_psbt", "Sign a base64 PSBT. Every input must have a known value, and the input sum must be within MAX_TX_INPUT_SATS. Broadcast only when broadcast is true. request_id is required. To retry, send the same PSBT and broadcast flag with the same request_id. Satchel returns the stored result and does not sign again.", json!({
             "type": "object",
-            "required": ["psbt"],
+            "required": ["psbt", "request_id"],
             "properties": {
                 "psbt": { "type": "string" },
                 "broadcast": { "type": "boolean" },
-                "request_id": { "type": "string" }
+                "request_id": {
+                    "type": "string",
+                    "description": "Required. Use one per PSBT, 1-80 letters, digits, or . _ : -. Reuse it only to retry the same PSBT and broadcast flag."
+                }
             }
         })),
         tool("spend_log", "Recent signed transactions. No secrets.", json!({
@@ -407,8 +418,7 @@ mod tests {
                         to: "bc1qtest".into(),
                         sats: 1500,
                         feerate: None,
-                        broadcast: false,
-                        request_id: None,
+                        mode: SendMode::DryRun,
                     }
                 );
             }
@@ -421,6 +431,100 @@ mod tests {
         assert!(matches!(missing, Incoming::Reply { body, .. } if body["error"]["code"] == -32602));
         let unknown = incoming(r#"{"jsonrpc":"2.0","id":4,"method":"nope"}"#, None);
         assert!(matches!(unknown, Incoming::Reply { body, .. } if body["error"]["code"] == -32601));
+    }
+
+    fn call(name: &str, arguments: Value) -> Incoming {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        incoming(&body.to_string(), None)
+    }
+
+    fn invalid_params(reply: Incoming) -> String {
+        match reply {
+            Incoming::Reply { body, .. } => {
+                assert_eq!(body["error"]["code"], -32602);
+                body["error"]["message"].as_str().unwrap().to_string()
+            }
+            other => panic!("expected invalid params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signing_calls_require_a_request_id() {
+        for request_id in [json!(null), json!("   ")] {
+            assert_eq!(
+                invalid_params(call(
+                    "send",
+                    json!({ "to": "bc1qtest", "sats": 1500, "broadcast": true, "request_id": request_id })
+                )),
+                "request_id is required when broadcast is true"
+            );
+        }
+        assert_eq!(
+            invalid_params(call(
+                "send",
+                json!({ "to": "bc1qtest", "sats": 1500, "broadcast": true })
+            )),
+            "request_id is required when broadcast is true"
+        );
+        assert_eq!(
+            invalid_params(call("sign_psbt", json!({ "psbt": "cHNidP8=" }))),
+            "request_id is required for sign_psbt"
+        );
+        assert_eq!(
+            invalid_params(call(
+                "sign_psbt",
+                json!({ "psbt": "cHNidP8=", "broadcast": false, "request_id": "" })
+            )),
+            "request_id is required for sign_psbt"
+        );
+        match call(
+            "send",
+            json!({ "to": "bc1qtest", "sats": 1500, "broadcast": true, "request_id": " invoice-8841 " }),
+        ) {
+            Incoming::Call { call, .. } => assert_eq!(
+                call,
+                ToolCall::Send {
+                    to: "bc1qtest".into(),
+                    sats: 1500,
+                    feerate: None,
+                    mode: SendMode::Broadcast {
+                        request_id: RequestId::parse("invoice-8841").unwrap()
+                    },
+                }
+            ),
+            other => panic!("expected call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dry_run_checks_and_drops_the_request_id() {
+        match call(
+            "send",
+            json!({ "to": "bc1qtest", "sats": 1500, "request_id": "invoice-8841" }),
+        ) {
+            Incoming::Call { call, .. } => assert_eq!(
+                call,
+                ToolCall::Send {
+                    to: "bc1qtest".into(),
+                    sats: 1500,
+                    feerate: None,
+                    mode: SendMode::DryRun,
+                }
+            ),
+            other => panic!("expected call, got {other:?}"),
+        }
+        assert_eq!(
+            invalid_params(call(
+                "send",
+                json!({ "to": "bc1qtest", "sats": 1500, "request_id": "pay/1" })
+            )),
+            "request_id must be 1-80 characters of letters, digits, or . _ : -"
+        );
     }
 
     #[test]

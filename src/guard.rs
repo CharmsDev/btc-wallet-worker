@@ -1,10 +1,14 @@
+use crate::idempotency::{Decision, Op};
 use crate::scan::{allocate_receive, merge_used, ScanCache};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 const DAY_MS: u64 = 86_400_000;
 const RETAIN_MS: u64 = 30 * DAY_MS;
 const MAX_RECORDS: usize = 500;
+const MAX_DEST_CHARS: usize = 240;
+/// SQLite Durable Objects reject a key and value that together exceed 2 MB.
+/// One mebibyte of JSON stays under that cap after the runtime stores the note.
+const MAX_LOG_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +29,8 @@ pub struct SpendRecord {
     /// Stable for one signing call, including a retry after a lost reply.
     #[serde(default)]
     pub id: String,
+    #[serde(default)]
+    pub request_id: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +45,18 @@ impl SpendLog {
         if !record.id.is_empty() && self.spends.iter().any(|spend| spend.id == record.id) {
             return;
         }
+        let mut record = record;
+        record.dest = shorten_dest(&record.dest);
+        for spend in &mut self.spends {
+            spend.dest = shorten_dest(&spend.dest);
+        }
         self.spends.push(record);
         if self.spends.len() > MAX_RECORDS {
             let overflow = self.spends.len() - MAX_RECORDS;
             self.spends.drain(0..overflow);
+        }
+        while self.spends.len() > 1 && stored_len(self) > MAX_LOG_BYTES {
+            self.spends.remove(0);
         }
     }
 
@@ -55,11 +69,26 @@ impl SpendLog {
     }
 }
 
+fn shorten_dest(dest: &str) -> String {
+    if dest.chars().count() <= MAX_DEST_CHARS {
+        return dest.to_string();
+    }
+    let mut out: String = dest.chars().take(MAX_DEST_CHARS - 3).collect();
+    out.push_str("...");
+    out
+}
+
+fn stored_len(log: &SpendLog) -> usize {
+    serde_json::to_vec(log)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum GuardOp {
-    AppendSpend {
-        record: SpendRecord,
+    Idempotency {
+        call: Op,
     },
     SpendLog {
         limit: u32,
@@ -84,7 +113,7 @@ pub enum GuardOp {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuardReply {
-    Appended,
+    Idempotency { decision: Decision },
     Log { spends: Vec<SpendRecord> },
     Scan { cache: ScanCache },
     ReceiveIndex { index: u32 },
@@ -116,24 +145,6 @@ pub fn take_receive(
     allocate_receive(cache, advance, max_index, gap)
 }
 
-pub fn unlogged_spend_warning(detail: &str) -> String {
-    format!("spend log was not recorded: {detail}")
-}
-
-pub fn attach_log_warning(mut body: Value, warning: Option<String>) -> Value {
-    if let Some(warning) = warning {
-        body["spend_log_warning"] = Value::String(warning);
-    }
-    body
-}
-
-pub fn join_log_warning(message: &str, warning: Option<String>) -> String {
-    match warning {
-        Some(warning) => format!("{message}; {warning}"),
-        None => message.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +159,7 @@ mod tests {
             client: "cursor".into(),
             kind: SpendKind::Send,
             id: format!("send:{txid}:{at_ms}"),
+            request_id: "invoice-8841".into(),
         }
     }
 
@@ -204,18 +216,30 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_spend_log_is_visible_on_the_response() {
-        let warning = Some(unlogged_spend_warning("storage failed"));
-        let body = attach_log_warning(serde_json::json!({ "signed": true }), warning.clone());
-        assert_eq!(
-            body["spend_log_warning"],
-            "spend log was not recorded: storage failed"
+    fn a_long_destination_is_shortened_and_a_later_row_still_fits() {
+        let mut log = SpendLog::default();
+        let huge = "ab".repeat(8_192);
+        for n in 0..40 {
+            let mut row = record(&format!("{n:064x}"), 1_000 + n);
+            row.dest = huge.clone();
+            row.id = format!("idem-{n}");
+            log.append(row, 2_000);
+        }
+        let mut ordinary = record(&format!("{:064x}", 41), 2_000);
+        ordinary.dest = "bc1qexample".into();
+        ordinary.id = "idem-ordinary".into();
+        log.append(ordinary, 2_000);
+        let rows = log.recent(200);
+        let latest = rows.iter().find(|row| row.id == "idem-ordinary").unwrap();
+        assert_eq!(latest.dest, "bc1qexample");
+        let shortened = format!(
+            "{}...",
+            "ab".repeat(8_192).chars().take(237).collect::<String>()
         );
-        let clean = attach_log_warning(serde_json::json!({ "signed": true }), None);
-        assert!(clean.get("spend_log_warning").is_none());
-        assert_eq!(
-            join_log_warning("broadcast rejected", warning),
-            "broadcast rejected; spend log was not recorded: storage failed"
-        );
+        assert!(rows
+            .iter()
+            .filter(|row| row.id != "idem-ordinary")
+            .all(|row| row.dest == shortened));
+        assert!(stored_len(&log) <= MAX_LOG_BYTES);
     }
 }

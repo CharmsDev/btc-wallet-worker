@@ -2,6 +2,8 @@ use crate::esplora::{plan_backends, Backend};
 use crate::wallet::{parse_fingerprint, NetworkKind, ScriptKind};
 use bitcoin::bip32::Fingerprint;
 
+const HOUR_MS: u64 = 3_600_000;
+
 #[derive(Clone, Debug)]
 pub struct AccessSpec {
     pub host: String,
@@ -28,6 +30,7 @@ pub struct Config {
     pub max_chain_calls: u32,
     pub fee_target_blocks: u32,
     pub max_tx_input_sats: u64,
+    pub idempotency_ttl_ms: u64,
     pub expected_fingerprint: Option<Fingerprint>,
     pub backends: Vec<Backend>,
     pub access: Option<AccessSpec>,
@@ -43,6 +46,7 @@ pub struct RawConfig {
     pub max_chain_calls: String,
     pub fee_target_blocks: String,
     pub max_tx_input_sats: String,
+    pub idempotency_ttl_hours: String,
     pub esplora_urls: String,
     pub expected_fingerprint: String,
     pub access_team_domain: String,
@@ -83,6 +87,12 @@ impl Config {
         if max_tx_input_sats == 0 {
             return Err("MAX_TX_INPUT_SATS must be greater than zero".into());
         }
+        let idempotency_ttl_hours = bounded(
+            parse_u32(&raw.idempotency_ttl_hours, 168, "IDEMPOTENCY_TTL_HOURS")?,
+            24,
+            168,
+            "IDEMPOTENCY_TTL_HOURS",
+        )?;
         let expected_fingerprint = if raw.expected_fingerprint.trim().is_empty() {
             None
         } else {
@@ -99,6 +109,7 @@ impl Config {
             max_chain_calls,
             fee_target_blocks,
             max_tx_input_sats,
+            idempotency_ttl_ms: u64::from(idempotency_ttl_hours) * HOUR_MS,
             expected_fingerprint,
             backends,
             access,
@@ -184,5 +195,25 @@ mod tests {
         );
         raw.access_aud.clear();
         assert!(Config::from_raw(&raw).is_err());
+    }
+
+    #[test]
+    fn idempotency_ttl_defaults_to_a_week_and_rejects_values_outside_one_to_seven_days() {
+        let ttl = |hours: &str| {
+            Config::from_raw(&RawConfig {
+                idempotency_ttl_hours: hours.into(),
+                ..RawConfig::default()
+            })
+            .map(|config| config.idempotency_ttl_ms)
+        };
+        assert_eq!(ttl(""), Ok(604_800_000));
+        assert_eq!(ttl("24"), Ok(86_400_000));
+        assert_eq!(ttl("168"), Ok(604_800_000));
+        for hours in ["23", "169"] {
+            assert_eq!(
+                ttl(hours),
+                Err("IDEMPOTENCY_TTL_HOURS must be between 24 and 168".into())
+            );
+        }
     }
 }
