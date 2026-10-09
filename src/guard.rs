@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 const DAY_MS: u64 = 86_400_000;
 const RETAIN_MS: u64 = 30 * DAY_MS;
 const MAX_RECORDS: usize = 500;
+const MAX_DEST_CHARS: usize = 240;
+/// SQLite Durable Objects reject a key and value that together exceed 2 MB.
+/// One mebibyte of JSON stays under that cap after the runtime stores the note.
+const MAX_LOG_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,10 +45,18 @@ impl SpendLog {
         if !record.id.is_empty() && self.spends.iter().any(|spend| spend.id == record.id) {
             return;
         }
+        let mut record = record;
+        record.dest = shorten_dest(&record.dest);
+        for spend in &mut self.spends {
+            spend.dest = shorten_dest(&spend.dest);
+        }
         self.spends.push(record);
         if self.spends.len() > MAX_RECORDS {
             let overflow = self.spends.len() - MAX_RECORDS;
             self.spends.drain(0..overflow);
+        }
+        while self.spends.len() > 1 && stored_len(self) > MAX_LOG_BYTES {
+            self.spends.remove(0);
         }
     }
 
@@ -55,6 +67,21 @@ impl SpendLog {
         spends.truncate(limit);
         spends
     }
+}
+
+fn shorten_dest(dest: &str) -> String {
+    if dest.chars().count() <= MAX_DEST_CHARS {
+        return dest.to_string();
+    }
+    let mut out: String = dest.chars().take(MAX_DEST_CHARS - 3).collect();
+    out.push_str("...");
+    out
+}
+
+fn stored_len(log: &SpendLog) -> usize {
+    serde_json::to_vec(log)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,5 +213,33 @@ mod tests {
         let other = record(&"bb".repeat(32), 11);
         log.append(other, 30);
         assert_eq!(log.recent(10).len(), 2);
+    }
+
+    #[test]
+    fn a_long_destination_is_shortened_and_a_later_row_still_fits() {
+        let mut log = SpendLog::default();
+        let huge = "ab".repeat(8_192);
+        for n in 0..40 {
+            let mut row = record(&format!("{n:064x}"), 1_000 + n);
+            row.dest = huge.clone();
+            row.id = format!("idem-{n}");
+            log.append(row, 2_000);
+        }
+        let mut ordinary = record(&format!("{:064x}", 41), 2_000);
+        ordinary.dest = "bc1qexample".into();
+        ordinary.id = "idem-ordinary".into();
+        log.append(ordinary, 2_000);
+        let rows = log.recent(200);
+        let latest = rows.iter().find(|row| row.id == "idem-ordinary").unwrap();
+        assert_eq!(latest.dest, "bc1qexample");
+        let shortened = format!(
+            "{}...",
+            "ab".repeat(8_192).chars().take(237).collect::<String>()
+        );
+        assert!(rows
+            .iter()
+            .filter(|row| row.id != "idem-ordinary")
+            .all(|row| row.dest == shortened));
+        assert!(stored_len(&log) <= MAX_LOG_BYTES);
     }
 }
