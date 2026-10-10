@@ -1,4 +1,6 @@
 use crate::wallet::NetworkKind;
+use bitcoin::consensus::encode::deserialize;
+use bitcoin::{Transaction, Txid};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -165,6 +167,18 @@ pub fn parse_utxos(body: &str) -> Result<Vec<Utxo>, String> {
             confirmed: row.status.confirmed,
         })
         .collect())
+}
+
+/// The txid check is what lets a signer trust a prevout value from a public backend.
+pub fn parse_funding_tx(body: &str, expected: Txid) -> Result<Transaction, String> {
+    let bytes =
+        hex::decode(body.trim()).map_err(|_| format!("transaction {expected} was not hex"))?;
+    let tx: Transaction =
+        deserialize(&bytes).map_err(|_| format!("transaction {expected} could not be decoded"))?;
+    if tx.compute_txid() != expected {
+        return Err(format!("transaction {expected} does not match its txid"));
+    }
+    Ok(tx)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -447,6 +461,43 @@ pub fn fold_broadcast(attempts: &[RawAttempt]) -> BroadcastVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    use std::str::FromStr;
+
+    #[test]
+    fn funding_hex_must_hash_to_the_txid_it_was_fetched_for() {
+        let funding = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let body = serialize_hex(&funding);
+        assert_eq!(
+            parse_funding_tx(&body, funding.compute_txid()),
+            Ok(funding.clone())
+        );
+        let other = Txid::from_str(&"ab".repeat(32)).unwrap();
+        assert_eq!(
+            parse_funding_tx(&body, other),
+            Err(format!("transaction {other} does not match its txid"))
+        );
+        assert_eq!(
+            parse_funding_tx("not hex", other),
+            Err(format!("transaction {other} was not hex"))
+        );
+    }
 
     #[test]
     fn mainnet_with_a_key_tries_enterprise_then_public_apis() {

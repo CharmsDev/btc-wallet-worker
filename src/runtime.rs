@@ -12,17 +12,19 @@ use crate::idempotency::{
     apply, body_key, client_message, Artifact, Body, Canon, Decision, Index, Op, RequestId, Slot,
     SpendFacts, WalletStamp, INDEX_KEY,
 };
+use crate::locks::{AllowLocked, InputChoice, Lockbook, LOCKS_KEY};
 use crate::mcp::{self, Incoming, SendMode, ToolCall};
 use crate::policy::enforce_input_cap;
 use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
-    annotate_owned_inputs, build_payment, extract_signed, indexes_from_origins, inspect_psbt,
-    psbt_from_base64, psbt_to_base64, sign_psbt, transaction_input_sats, Built, Coin, Payment,
+    annotate_owned_inputs, build_payment, coins_for_send, extract_signed, indexes_from_origins,
+    inspect_psbt, owned_scripts, psbt_from_base64, psbt_to_base64, sign_psbt,
+    transaction_input_sats, Built, Coin, Payment,
 };
 use crate::wallet::{parse_address, ChainKind, Wallet};
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Address, ScriptBuf};
+use bitcoin::Address;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,10 +113,12 @@ enum Effect {
         dest: Address,
         sats: u64,
         feerate: Option<u64>,
+        inputs: InputChoice,
     },
     Sign {
         psbt: Psbt,
         broadcast: bool,
+        allow_locked: AllowLocked,
     },
 }
 
@@ -131,13 +135,18 @@ impl App<'_> {
                 to,
                 sats,
                 feerate,
+                inputs,
                 mode,
-            } => self.send(&to, sats, feerate, mode).await,
+            } => self.send(&to, sats, feerate, inputs, mode).await,
             ToolCall::SignPsbt {
                 psbt,
                 broadcast,
+                allow_locked,
                 request_id,
-            } => self.sign_psbt(&psbt, broadcast, request_id).await,
+            } => {
+                self.sign_psbt(&psbt, broadcast, allow_locked, request_id)
+                    .await
+            }
             ToolCall::SpendLog { limit } => self.spend_log(limit).await,
         }
     }
@@ -324,25 +333,32 @@ impl App<'_> {
         to: &str,
         sats: u64,
         feerate: Option<u64>,
+        inputs: InputChoice,
         mode: SendMode,
     ) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let request_id = match mode {
-            SendMode::DryRun => return self.dry_run(&wallet, to, sats, feerate).await,
+            SendMode::DryRun => return self.dry_run(&wallet, to, sats, feerate, &inputs).await,
             SendMode::Broadcast { request_id } => request_id,
         };
         wallet.fingerprint_ok(self.config.expected_fingerprint)?;
         let dest = parse_address(to, self.config.network)?;
+        let listed = match &inputs {
+            InputChoice::Auto => None,
+            InputChoice::Exactly(set) => Some(set),
+        };
         let hash = Canon::send(
             &WalletStamp::of(&wallet),
             dest.script_pubkey().as_bytes(),
             sats,
             feerate,
+            listed,
         );
         let effect = Effect::Send {
             dest,
             sats,
             feerate,
+            inputs,
         };
         self.effect(&wallet, request_id, hash, effect).await
     }
@@ -353,9 +369,13 @@ impl App<'_> {
         to: &str,
         sats: u64,
         feerate: Option<u64>,
+        inputs: &InputChoice,
     ) -> Result<Value, String> {
         let dest = parse_address(to, self.config.network)?;
-        let (built, input_sats) = self.build_send(wallet, &dest, sats, feerate).await?;
+        let book = self.locks().await?;
+        let (built, input_sats) = self
+            .build_send(wallet, &dest, sats, feerate, inputs, &book)
+            .await?;
         Ok(json!({
             "broadcast": false,
             "signed": false,
@@ -373,6 +393,7 @@ impl App<'_> {
         &mut self,
         encoded: &str,
         broadcast: bool,
+        allow_locked: AllowLocked,
         request_id: RequestId,
     ) -> Result<Value, String> {
         let wallet = self.wallet()?;
@@ -382,8 +403,13 @@ impl App<'_> {
             &WalletStamp::of(&wallet),
             psbt.unsigned_tx.compute_txid().to_byte_array(),
             broadcast,
+            allow_locked,
         );
-        let effect = Effect::Sign { psbt, broadcast };
+        let effect = Effect::Sign {
+            psbt,
+            broadcast,
+            allow_locked,
+        };
         self.effect(&wallet, request_id, hash, effect).await
     }
 
@@ -411,8 +437,16 @@ impl App<'_> {
                 dest,
                 sats,
                 feerate,
-            } => self.sign_send(wallet, &dest, sats, feerate).await,
-            Effect::Sign { psbt, broadcast } => self.sign_foreign(wallet, psbt, broadcast).await,
+                inputs,
+            } => self.sign_send(wallet, &dest, sats, feerate, &inputs).await,
+            Effect::Sign {
+                psbt,
+                broadcast,
+                allow_locked,
+            } => {
+                self.sign_foreign(wallet, psbt, broadcast, allow_locked)
+                    .await
+            }
         };
         let artifact = match signed {
             Ok(artifact) => artifact,
@@ -490,8 +524,15 @@ impl App<'_> {
         dest: &Address,
         sats: u64,
         feerate: Option<u64>,
+        inputs: &InputChoice,
+        book: &Lockbook,
     ) -> Result<(Built, u64), String> {
-        let coins = self.collect_utxos(wallet).await?;
+        let coins = coins_for_send(
+            self.collect_utxos(wallet).await?,
+            inputs,
+            book,
+            self.config.auto_lock_sats,
+        )?;
         let feerate = match feerate {
             Some(rate) => rate,
             None => self.chosen_feerate().await?,
@@ -519,10 +560,21 @@ impl App<'_> {
         dest: &Address,
         sats: u64,
         feerate: Option<u64>,
+        inputs: &InputChoice,
     ) -> Result<Artifact, String> {
-        let (built, input_sats) = self.build_send(wallet, dest, sats, feerate).await?;
+        let book = self.locks().await?;
+        let (built, input_sats) = self
+            .build_send(wallet, dest, sats, feerate, inputs, &book)
+            .await?;
         let mut psbt = built.psbt;
-        sign_psbt(wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        sign_psbt(
+            wallet,
+            &mut psbt,
+            &book,
+            inputs.allow_locked(),
+            self.config.max_tx_input_sats,
+            self.config.auto_lock_sats,
+        )?;
         let (txid, raw_tx_hex) = extract_signed(&psbt)?;
         let response = json!({
             "broadcast": true,
@@ -553,11 +605,17 @@ impl App<'_> {
         wallet: &Wallet,
         mut psbt: Psbt,
         broadcast: bool,
+        allow_locked: AllowLocked,
     ) -> Result<Artifact, String> {
         let input_sats = transaction_input_sats(&psbt)?;
         enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
         let (cache, _, _) = self.discover(wallet).await?;
-        let owned = owned_scripts(wallet, &cache, &psbt, self.config.max_scan_index)?;
+        let owned = owned_scripts(
+            wallet,
+            &cache,
+            self.config.max_scan_index,
+            indexes_from_origins(wallet, &psbt),
+        )?;
         annotate_owned_inputs(wallet, &mut psbt, &owned)?;
         let inspection = inspect_psbt(
             &psbt,
@@ -565,7 +623,15 @@ impl App<'_> {
             self.config.script,
             self.config.network.bitcoin(),
         )?;
-        sign_psbt(wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        let book = self.locks().await?;
+        sign_psbt(
+            wallet,
+            &mut psbt,
+            &book,
+            allow_locked,
+            self.config.max_tx_input_sats,
+            self.config.auto_lock_sats,
+        )?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let response = json!({
             "broadcast": broadcast,
@@ -744,6 +810,14 @@ impl App<'_> {
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {
         match guard_call(self.ctx, &GuardOp::GetScan).await? {
             GuardReply::Scan { cache } => Ok(cache),
+            GuardReply::Error { message } => Err(message),
+            _ => Err("spend guard returned an unexpected payload".into()),
+        }
+    }
+
+    async fn locks(&self) -> Result<Lockbook, String> {
+        match guard_call(self.ctx, &GuardOp::GetLocks).await? {
+            GuardReply::Locks { book } => Ok(book),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
         }
@@ -937,43 +1011,6 @@ fn coin_from(wallet: &Wallet, chain: ChainKind, index: u32, utxo: Utxo) -> Resul
         public_key: derived.public_key,
         confirmed: utxo.confirmed,
     })
-}
-
-fn owned_scripts(
-    wallet: &Wallet,
-    cache: &ScanCache,
-    psbt: &Psbt,
-    max_index: u32,
-) -> Result<BTreeMap<ScriptBuf, (ChainKind, u32)>, String> {
-    let mut indexes = BTreeMap::<ChainKind, BTreeSet<u32>>::new();
-    let extent = |used: &[u32]| {
-        used.iter()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(cache.receive_cursor)
-    };
-    for index in 0..=extent(&cache.used_external).min(max_index) {
-        indexes
-            .entry(ChainKind::External)
-            .or_default()
-            .insert(index);
-    }
-    for index in 0..=extent(&cache.used_change).min(max_index) {
-        indexes.entry(ChainKind::Change).or_default().insert(index);
-    }
-    for (chain, index) in indexes_from_origins(wallet, psbt) {
-        indexes.entry(chain).or_default().insert(index);
-    }
-    let mut owned = BTreeMap::new();
-    for (chain, set) in indexes {
-        for index in set {
-            let derived = wallet.derive(chain, index)?;
-            owned.insert(derived.address.script_pubkey(), (chain, index));
-        }
-    }
-    Ok(owned)
 }
 
 fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
@@ -1197,6 +1234,14 @@ impl DurableObject for SpendGuard {
                     .await?;
                 GuardReply::OauthMiss
             }
+            GuardOp::GetLocks => match self.state.storage().get::<Lockbook>(LOCKS_KEY).await {
+                Ok(book) => GuardReply::Locks {
+                    book: book.unwrap_or_default(),
+                },
+                Err(err) => GuardReply::Error {
+                    message: format!("stored locks could not be read: {err}"),
+                },
+            },
         };
         reply(&reply_body)
     }

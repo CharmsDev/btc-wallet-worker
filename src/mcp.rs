@@ -1,4 +1,5 @@
 use crate::idempotency::RequestId;
+use crate::locks::{AllowLocked, InputChoice, InputSet};
 use serde_json::{json, Value};
 
 pub const PROTOCOL: &str = "2025-06-18";
@@ -26,11 +27,13 @@ pub enum ToolCall {
         to: String,
         sats: u64,
         feerate: Option<u64>,
+        inputs: InputChoice,
         mode: SendMode,
     },
     SignPsbt {
         psbt: String,
         broadcast: bool,
+        allow_locked: AllowLocked,
         request_id: RequestId,
     },
     SpendLog {
@@ -169,11 +172,13 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
             to: string_arg(&args, "to")?,
             sats: required_u64(&args, "sats")?,
             feerate: optional_feerate(&args)?,
+            inputs: input_choice(&args)?,
             mode: send_mode(&args)?,
         }),
         "sign_psbt" => Ok(ToolCall::SignPsbt {
             psbt: string_arg(&args, "psbt")?,
             broadcast: bool_arg(&args, "broadcast", false)?,
+            allow_locked: allow_locked_arg(&args)?,
             request_id: required_request_id(&args, "request_id is required for sign_psbt")?,
         }),
         "spend_log" => Ok(ToolCall::SpendLog {
@@ -252,6 +257,33 @@ fn optional_feerate(args: &Value) -> Result<Option<u64>, String> {
     }
 }
 
+fn input_choice(args: &Value) -> Result<InputChoice, String> {
+    match args.get("inputs") {
+        None | Some(Value::Null) => Ok(InputChoice::Auto),
+        Some(_) => outpoints_arg(args, "inputs").map(InputChoice::Exactly),
+    }
+}
+
+fn outpoints_arg(args: &Value, name: &str) -> Result<InputSet, String> {
+    let malformed = || format!("{name} must be a list of txid:vout strings");
+    let Some(Value::Array(items)) = args.get(name) else {
+        return Err(malformed());
+    };
+    let items = items
+        .iter()
+        .map(|item| item.as_str().ok_or_else(malformed))
+        .collect::<Result<Vec<&str>, String>>()?;
+    InputSet::parse(name, &items)
+}
+
+fn allow_locked_arg(args: &Value) -> Result<AllowLocked, String> {
+    match args.get("allow_locked") {
+        None | Some(Value::Bool(false)) => Ok(AllowLocked::No),
+        Some(Value::Bool(true)) => Ok(AllowLocked::Yes),
+        _ => Err("allow_locked must be a boolean".into()),
+    }
+}
+
 fn send_mode(args: &Value) -> Result<SendMode, String> {
     if !bool_arg(args, "broadcast", false)? {
         optional_request_id(args)?;
@@ -312,13 +344,19 @@ fn tool_specs() -> Vec<Value> {
         tool("utxos", "Unspent outputs known to the wallet.", json!({ "type": "object", "properties": {} })),
         tool("fee_estimates", "Esplora fee estimates in sat/vB.", json!({ "type": "object", "properties": {} })),
         tool("descriptor", "Public account descriptors and the master fingerprint.", json!({ "type": "object", "properties": {} })),
-        tool("send", "Build a payment. Dry-run unless broadcast is true. With broadcast true it signs and broadcasts, and request_id is required. To retry, send the same arguments with the same request_id. Satchel returns the stored result or rebroadcasts the same transaction, and it does not sign a second one.", json!({
+        tool("send", "Build a payment. Dry-run unless broadcast is true. With broadcast true it signs and broadcasts, and request_id is required. Without inputs, coin selection skips locked coins. With inputs, only the listed coins are considered, they may be locked, and selection may leave a listed coin unspent. To retry, send the same arguments with the same request_id. Satchel returns the stored result or rebroadcasts the same transaction, and it does not sign a second one.", json!({
             "type": "object",
             "required": ["to", "sats"],
             "properties": {
                 "to": { "type": "string" },
                 "sats": { "type": "integer", "minimum": 1 },
                 "feerate": { "type": "number" },
+                "inputs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Optional txid:vout outpoints to choose from. Listing a locked coin allows spending it. To spend an exact set, build the transaction and call sign_tx."
+                },
                 "broadcast": { "type": "boolean" },
                 "request_id": {
                     "type": "string",
@@ -326,15 +364,19 @@ fn tool_specs() -> Vec<Value> {
                 }
             }
         })),
-        tool("sign_psbt", "Sign a base64 PSBT. Every input must have a known value, and the input sum must be within MAX_TX_INPUT_SATS. Broadcast only when broadcast is true. request_id is required. To retry, send the same PSBT and broadcast flag with the same request_id. Satchel returns the stored result and does not sign again.", json!({
+        tool("sign_psbt", "Sign a base64 PSBT. Every input must have a known value, and the input sum must be within MAX_TX_INPUT_SATS. It refuses to spend a locked output unless allow_locked is true. Broadcast only when broadcast is true. request_id is required. To retry, send the same PSBT, broadcast flag, and allow_locked with the same request_id. Satchel returns the stored result and does not sign again.", json!({
             "type": "object",
             "required": ["psbt", "request_id"],
             "properties": {
                 "psbt": { "type": "string" },
                 "broadcast": { "type": "boolean" },
+                "allow_locked": {
+                    "type": "boolean",
+                    "description": "Set true to sign inputs that spend locked outputs. Default false."
+                },
                 "request_id": {
                     "type": "string",
-                    "description": "Required. Use one per PSBT, 1-80 letters, digits, or . _ : -. Reuse it only to retry the same PSBT and broadcast flag."
+                    "description": "Required. Use one per PSBT, 1-80 letters, digits, or . _ : -. Reuse it only to retry the same PSBT, broadcast flag, and allow_locked."
                 }
             }
         })),
@@ -418,6 +460,7 @@ mod tests {
                         to: "bc1qtest".into(),
                         sats: 1500,
                         feerate: None,
+                        inputs: InputChoice::Auto,
                         mode: SendMode::DryRun,
                     }
                 );
@@ -492,6 +535,7 @@ mod tests {
                     to: "bc1qtest".into(),
                     sats: 1500,
                     feerate: None,
+                    inputs: InputChoice::Auto,
                     mode: SendMode::Broadcast {
                         request_id: RequestId::parse("invoice-8841").unwrap()
                     },
@@ -513,6 +557,7 @@ mod tests {
                     to: "bc1qtest".into(),
                     sats: 1500,
                     feerate: None,
+                    inputs: InputChoice::Auto,
                     mode: SendMode::DryRun,
                 }
             ),
@@ -524,6 +569,90 @@ mod tests {
                 json!({ "to": "bc1qtest", "sats": 1500, "request_id": "pay/1" })
             )),
             "request_id must be 1-80 characters of letters, digits, or . _ : -"
+        );
+    }
+
+    #[test]
+    fn send_inputs_are_a_non_empty_set_of_outpoints() {
+        let first = format!("{}:1", "bb".repeat(32));
+        let second = format!("{}:0", "aa".repeat(32));
+        match call(
+            "send",
+            json!({ "to": "bc1qtest", "sats": 1500, "inputs": [first, second] }),
+        ) {
+            Incoming::Call { call, .. } => assert_eq!(
+                call,
+                ToolCall::Send {
+                    to: "bc1qtest".into(),
+                    sats: 1500,
+                    feerate: None,
+                    inputs: InputChoice::Exactly(
+                        InputSet::parse("inputs", &[&second, &first]).unwrap()
+                    ),
+                    mode: SendMode::DryRun,
+                }
+            ),
+            other => panic!("expected call, got {other:?}"),
+        }
+        match call(
+            "send",
+            json!({ "to": "bc1qtest", "sats": 1500, "inputs": null }),
+        ) {
+            Incoming::Call {
+                call: ToolCall::Send { inputs, .. },
+                ..
+            } => assert_eq!(inputs, InputChoice::Auto),
+            other => panic!("expected call, got {other:?}"),
+        }
+        let send_with = |inputs: Value| {
+            invalid_params(call(
+                "send",
+                json!({ "to": "bc1qtest", "sats": 1500, "inputs": inputs }),
+            ))
+        };
+        assert_eq!(
+            send_with(json!([])),
+            "inputs must list at least one outpoint"
+        );
+        assert_eq!(
+            send_with(json!([first, first])),
+            format!("inputs lists {first} more than once")
+        );
+        assert_eq!(
+            send_with(json!(first)),
+            "inputs must be a list of txid:vout strings"
+        );
+        assert_eq!(
+            send_with(json!(["nope"])),
+            "inputs entry nope is not a txid:vout outpoint"
+        );
+    }
+
+    #[test]
+    fn allow_locked_defaults_to_no() {
+        let sign = |extra: Value| {
+            let mut arguments = json!({ "psbt": "cHNidP8=", "request_id": "psbt-1" });
+            if let Value::Object(fields) = extra {
+                arguments.as_object_mut().unwrap().extend(fields);
+            }
+            call("sign_psbt", arguments)
+        };
+        for (extra, expected) in [
+            (json!({}), AllowLocked::No),
+            (json!({ "allow_locked": false }), AllowLocked::No),
+            (json!({ "allow_locked": true }), AllowLocked::Yes),
+        ] {
+            match sign(extra) {
+                Incoming::Call {
+                    call: ToolCall::SignPsbt { allow_locked, .. },
+                    ..
+                } => assert_eq!(allow_locked, expected),
+                other => panic!("expected call, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            invalid_params(sign(json!({ "allow_locked": "yes" }))),
+            "allow_locked must be a boolean"
         );
     }
 

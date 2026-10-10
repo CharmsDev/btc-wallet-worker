@@ -1,5 +1,7 @@
 use crate::guard::{SpendKind, SpendRecord};
+use crate::locks::{AllowLocked, InputSet};
 use crate::wallet::{NetworkKind, ScriptKind, Wallet};
+use bitcoin::hashes::Hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -136,7 +138,7 @@ impl WalletStamp {
 }
 
 fn push_len_bytes(bytes: &mut Vec<u8>, payload: &[u8]) {
-    let length = u64::try_from(payload.len()).expect("script length fits in u64");
+    let length = u64::try_from(payload.len()).expect("payload length fits in u64");
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(payload);
 }
@@ -146,12 +148,14 @@ pub struct Canon([u8; 32]);
 
 impl Canon {
     /// `feerate` is the client's argument, not the estimate a build substitutes,
-    /// so a retry after estimates move is the same request.
+    /// so a retry after estimates move is the same request. Omitted `inputs`
+    /// writes nothing, so a send without them keeps the hash it had before locks.
     pub fn send(
         wallet: &WalletStamp,
         script_pubkey: &[u8],
         sats: u64,
         feerate: Option<u64>,
+        inputs: Option<&InputSet>,
     ) -> Self {
         let mut bytes = wallet.prefix(1);
         push_len_bytes(&mut bytes, script_pubkey);
@@ -163,13 +167,50 @@ impl Canon {
                 bytes.extend_from_slice(&rate.to_be_bytes());
             }
         }
+        if let Some(inputs) = inputs {
+            let outpoints = inputs.outpoints();
+            let count = u32::try_from(outpoints.len()).expect("input count fits in u32");
+            bytes.push(1);
+            bytes.extend_from_slice(&count.to_be_bytes());
+            for outpoint in outpoints {
+                bytes.extend_from_slice(&outpoint.txid.to_byte_array());
+                bytes.extend_from_slice(&outpoint.vout.to_be_bytes());
+            }
+        }
         Self::digest(&bytes)
     }
 
-    pub fn sign(wallet: &WalletStamp, unsigned_txid: [u8; 32], broadcast: bool) -> Self {
+    /// `AllowLocked::No` writes nothing, so it keeps the hash a sign had before locks.
+    pub fn sign(
+        wallet: &WalletStamp,
+        unsigned_txid: [u8; 32],
+        broadcast: bool,
+        allow: AllowLocked,
+    ) -> Self {
         let mut bytes = wallet.prefix(2);
         bytes.extend_from_slice(&unsigned_txid);
         bytes.push(u8::from(broadcast));
+        match allow {
+            AllowLocked::No => {}
+            AllowLocked::Yes => bytes.push(1),
+        }
+        Self::digest(&bytes)
+    }
+
+    /// Hashes the client's bytes, not the txid, so a changed witness is a new request.
+    pub fn sign_tx(
+        wallet: &WalletStamp,
+        raw_tx: &[u8],
+        broadcast: bool,
+        allow: AllowLocked,
+    ) -> Self {
+        let mut bytes = wallet.prefix(3);
+        push_len_bytes(&mut bytes, raw_tx);
+        bytes.push(u8::from(broadcast));
+        bytes.push(match allow {
+            AllowLocked::No => 0,
+            AllowLocked::Yes => 1,
+        });
         Self::digest(&bytes)
     }
 
@@ -619,6 +660,10 @@ pub fn client_message(decision: &Decision, request_id: &RequestId) -> String {
 mod tests {
     use super::*;
     use crate::wallet::parse_address;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version;
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, Witness};
     use serde_json::json;
 
     const T0: u64 = 1_800_000_000_000;
@@ -680,7 +725,17 @@ mod tests {
     }
 
     fn send_hash(feerate: Option<u64>) -> Canon {
-        Canon::send(&stamp(), &script_of(DEST), 25_000, feerate)
+        Canon::send(&stamp(), &script_of(DEST), 25_000, feerate, None)
+    }
+
+    fn preimage(kind: u8) -> Vec<u8> {
+        let mut bytes = b"satchel.idem.v1\0".to_vec();
+        bytes.extend_from_slice(&[kind, 0, 84, 0, 0, 0, 0, 0x73, 0xc5, 0xda, 0x0a]);
+        bytes
+    }
+
+    fn inputs(items: &[&str]) -> InputSet {
+        InputSet::parse("inputs", items).unwrap()
     }
 
     fn begin(slot: &Slot, hash: Canon) -> Op {
@@ -986,37 +1041,166 @@ mod tests {
         let lower = script_of(DEST);
         let upper = script_of("BC1QCR8TE4KR609GCAWUTMRZA0J4XV80JY8Z306FYU");
         assert_ne!(
-            Canon::send(&stamp(), &lower, 25_000, None),
-            Canon::send(&stamp(), &lower, 25_000, Some(5))
+            Canon::send(&stamp(), &lower, 25_000, None, None),
+            Canon::send(&stamp(), &lower, 25_000, Some(5), None)
         );
         assert_eq!(
-            Canon::send(&stamp(), &lower, 25_000, Some(5)),
-            Canon::send(&stamp(), &upper, 25_000, Some(5))
+            Canon::send(&stamp(), &lower, 25_000, Some(5), None),
+            Canon::send(&stamp(), &upper, 25_000, Some(5), None)
         );
         let other_seed = WalletStamp {
             fingerprint: [0, 0, 0, 0],
             ..stamp()
         };
         assert_ne!(
-            Canon::send(&other_seed, &lower, 25_000, Some(5)),
-            Canon::send(&stamp(), &lower, 25_000, Some(5))
+            Canon::send(&other_seed, &lower, 25_000, Some(5), None),
+            Canon::send(&stamp(), &lower, 25_000, Some(5), None)
+        );
+    }
+
+    #[test]
+    fn a_send_without_inputs_hashes_the_bytes_it_hashed_before_locks() {
+        let script = script_of(DEST);
+        let mut bytes = preimage(1);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 22]);
+        bytes.extend_from_slice(&script);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x61, 0xa8]);
+        bytes.push(0);
+        assert_eq!(
+            Canon::send(&stamp(), &script, 25_000, None, None),
+            Canon(Sha256::digest(&bytes).into())
+        );
+    }
+
+    #[test]
+    fn listed_inputs_hash_as_a_set() {
+        let script = script_of(DEST);
+        let first = format!("{TXID_A}:0");
+        let second = format!("{TXID_B}:1");
+        let send = |listed: Option<&InputSet>| Canon::send(&stamp(), &script, 25_000, None, listed);
+        assert_eq!(
+            send(Some(&inputs(&[&first, &second]))),
+            send(Some(&inputs(&[&second, &first])))
+        );
+        assert_ne!(
+            send(Some(&inputs(&[&first]))),
+            send(Some(&inputs(&[&first, &second])))
+        );
+        assert_ne!(send(None), send(Some(&inputs(&[&first]))));
+
+        let mut bytes = preimage(1);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 22]);
+        bytes.extend_from_slice(&script);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x61, 0xa8]);
+        bytes.extend_from_slice(&[0, 1, 0, 0, 0, 1]);
+        bytes.extend_from_slice(&[0xaa; 32]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            send(Some(&inputs(&[&first]))),
+            Canon(Sha256::digest(&bytes).into())
         );
     }
 
     #[test]
     fn a_sign_hash_covers_the_versioned_bytes_and_the_broadcast_flag() {
-        let mut bytes = b"satchel.idem.v1\0".to_vec();
-        bytes.extend_from_slice(&[2, 0, 84, 0, 0, 0, 0, 0x73, 0xc5, 0xda, 0x0a]);
+        let mut bytes = preimage(2);
         bytes.extend_from_slice(&[0xab; 32]);
         bytes.push(1);
         assert_eq!(
-            Canon::sign(&stamp(), [0xab; 32], true),
+            Canon::sign(&stamp(), [0xab; 32], true, AllowLocked::No),
             Canon(Sha256::digest(&bytes).into())
         );
         assert_ne!(
-            Canon::sign(&stamp(), [0xab; 32], false),
-            Canon::sign(&stamp(), [0xab; 32], true)
+            Canon::sign(&stamp(), [0xab; 32], false, AllowLocked::No),
+            Canon::sign(&stamp(), [0xab; 32], true, AllowLocked::No)
         );
+        bytes.push(1);
+        assert_eq!(
+            Canon::sign(&stamp(), [0xab; 32], true, AllowLocked::Yes),
+            Canon(Sha256::digest(&bytes).into())
+        );
+    }
+
+    #[test]
+    fn a_sign_tx_hash_covers_the_raw_bytes_including_the_witness() {
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::from_slice(&[[0xde]]),
+            }],
+            output: vec![],
+        };
+        let raw = serialize(&tx);
+        tx.input[0].witness = Witness::from_slice(&[[0xdf]]);
+        let rewitnessed = serialize(&tx);
+        assert_eq!(raw.len(), rewitnessed.len());
+        assert_ne!(
+            Canon::sign_tx(&stamp(), &raw, false, AllowLocked::No),
+            Canon::sign_tx(&stamp(), &rewitnessed, false, AllowLocked::No)
+        );
+        assert_ne!(
+            Canon::sign_tx(&stamp(), &[0xab; 32], true, AllowLocked::No),
+            Canon::sign(&stamp(), [0xab; 32], true, AllowLocked::No)
+        );
+
+        let mut bytes = preimage(3);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 2, 0x02, 0x00]);
+        bytes.extend_from_slice(&[1, 0]);
+        assert_eq!(
+            Canon::sign_tx(&stamp(), &[0x02, 0x00], true, AllowLocked::No),
+            Canon(Sha256::digest(&bytes).into())
+        );
+        assert_ne!(
+            Canon::sign_tx(&stamp(), &[0x02, 0x00], true, AllowLocked::Yes),
+            Canon(Sha256::digest(&bytes).into())
+        );
+    }
+
+    #[test]
+    fn a_signed_only_sign_tx_replays_the_stored_hex() {
+        let mut store = Store::default();
+        let slot = key("coinjoin-12");
+        let hash = Canon::sign_tx(&stamp(), &[0x02, 0x00], false, AllowLocked::No);
+        let response =
+            json!({ "broadcast": false, "signed": true, "txid": TXID_A, "tx_hex": "0200beef" });
+        assert_eq!(
+            store.run(T0, begin(&slot, hash)),
+            Decision::Proceed { generation: 1 }
+        );
+        let committed = store.run(
+            T0 + 1,
+            Op::Commit {
+                slot: slot.clone(),
+                generation: 1,
+                hash,
+                artifact: Artifact::SignedOnly {
+                    response: response.clone(),
+                    txid: TXID_A.into(),
+                    facts: SpendFacts {
+                        kind: SpendKind::SignTx,
+                        input_sats: 50_000,
+                        dest: DEST.into(),
+                        fee_sats: 1_000,
+                    },
+                },
+            },
+        );
+        assert_eq!(
+            committed,
+            Decision::Return {
+                response: response.clone()
+            }
+        );
+        assert_eq!(
+            store.run(T0 + 60_000, begin(&slot, hash)),
+            Decision::Return { response }
+        );
+        assert_eq!(store.raw_hexes(), Vec::<String>::new());
+        assert_eq!(store.spends, ["idem-1"]);
     }
 
     #[test]

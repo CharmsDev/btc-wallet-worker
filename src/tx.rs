@@ -1,21 +1,21 @@
+use crate::locks::{refuse_locked, AllowLocked, InputChoice, Lockbook, Scope};
 use crate::policy::enforce_input_cap;
+use crate::scan::ScanCache;
 use crate::wallet::{xonly_of, ChainKind, ScriptKind, Wallet};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
 use bitcoin::consensus::encode::serialize_hex;
-#[cfg(test)]
 use bitcoin::hashes::Hash;
+use bitcoin::key::{Keypair, TapTweak};
 use bitcoin::psbt::Psbt;
-use bitcoin::secp256k1::{PublicKey, Secp256k1};
-#[cfg(test)]
-use bitcoin::sighash::SighashCache;
-use bitcoin::sighash::{EcdsaSighashType, TapSighashType};
+use bitcoin::secp256k1::{Message, PublicKey, Secp256k1};
+use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::transaction::Version;
 use bitcoin::{
-    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
-    Witness,
+    ecdsa, taproot, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+    TxOut, Txid, Witness,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -31,6 +31,54 @@ pub struct Coin {
     pub path: DerivationPath,
     pub public_key: PublicKey,
     pub confirmed: bool,
+}
+
+impl Coin {
+    pub fn outpoint(&self) -> OutPoint {
+        OutPoint {
+            txid: self.txid,
+            vout: self.vout,
+        }
+    }
+}
+
+pub fn coins_for_send(
+    coins: Vec<Coin>,
+    choice: &InputChoice,
+    book: &Lockbook,
+    auto_lock_sats: u64,
+) -> Result<Vec<Coin>, String> {
+    match choice {
+        InputChoice::Auto => {
+            let found = !coins.is_empty();
+            let pool: Vec<Coin> = coins
+                .into_iter()
+                .filter(|coin| {
+                    book.reason(coin.outpoint(), coin.value, Scope::Wallet, auto_lock_sats)
+                        .is_none()
+                })
+                .collect();
+            if found && pool.is_empty() {
+                return Err("no selectable utxos; locked outputs were skipped".into());
+            }
+            Ok(pool)
+        }
+        InputChoice::Exactly(listed) => {
+            let mut by_outpoint: BTreeMap<OutPoint, Coin> = coins
+                .into_iter()
+                .map(|coin| (coin.outpoint(), coin))
+                .collect();
+            listed
+                .outpoints()
+                .iter()
+                .map(|outpoint| {
+                    by_outpoint
+                        .remove(outpoint)
+                        .ok_or_else(|| format!("input {outpoint} is not an unspent wallet output"))
+                })
+                .collect()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -224,10 +272,7 @@ fn unsigned_tx(coins: &[&Coin], outputs: &[TxOut]) -> Transaction {
         input: coins
             .iter()
             .map(|coin| TxIn {
-                previous_output: OutPoint {
-                    txid: coin.txid,
-                    vout: coin.vout,
-                },
+                previous_output: coin.outpoint(),
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -453,9 +498,22 @@ pub fn transaction_input_sats(psbt: &Psbt) -> Result<u64, String> {
     Ok(total)
 }
 
-pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt, max_input_sats: u64) -> Result<u64, String> {
+pub fn sign_psbt(
+    wallet: &Wallet,
+    psbt: &mut Psbt,
+    book: &Lockbook,
+    allow: AllowLocked,
+    max_input_sats: u64,
+    auto_lock_sats: u64,
+) -> Result<u64, String> {
     let input_sats = transaction_input_sats(psbt)?;
     enforce_input_cap(input_sats, max_input_sats)?;
+    refuse_locked(
+        &psbt_spends(psbt, wallet.fingerprint())?,
+        book,
+        allow,
+        auto_lock_sats,
+    )?;
     require_committing_sighash(psbt, wallet)?;
     let secp = Secp256k1::new();
     match psbt.sign(wallet.master_key(), &secp) {
@@ -470,18 +528,40 @@ pub fn sign_psbt(wallet: &Wallet, psbt: &mut Psbt, max_input_sats: u64) -> Resul
     Ok(input_sats)
 }
 
+fn psbt_spends(
+    psbt: &Psbt,
+    fingerprint: Fingerprint,
+) -> Result<Vec<(OutPoint, u64, Scope)>, String> {
+    psbt.inputs
+        .iter()
+        .zip(&psbt.unsigned_tx.input)
+        .map(|(input, txin)| {
+            let scope = if signs_input(input, fingerprint) {
+                Scope::Wallet
+            } else {
+                Scope::Foreign
+            };
+            let value = input_utxo(input, txin)?.value.to_sat();
+            Ok((txin.previous_output, value, scope))
+        })
+        .collect()
+}
+
+fn signs_input(input: &bitcoin::psbt::Input, fingerprint: Fingerprint) -> bool {
+    input
+        .bip32_derivation
+        .values()
+        .any(|(origin, _)| *origin == fingerprint)
+        || input
+            .tap_key_origins
+            .values()
+            .any(|(_, (origin, _))| *origin == fingerprint)
+}
+
 fn require_committing_sighash(psbt: &Psbt, wallet: &Wallet) -> Result<(), String> {
     let fingerprint = wallet.fingerprint();
     for (index, input) in psbt.inputs.iter().enumerate() {
-        let ours = input
-            .bip32_derivation
-            .values()
-            .any(|(origin, _)| *origin == fingerprint)
-            || input
-                .tap_key_origins
-                .values()
-                .any(|(_, (origin, _))| *origin == fingerprint);
-        if !ours {
+        if !signs_input(input, fingerprint) {
             continue;
         }
         match wallet.script() {
@@ -547,13 +627,154 @@ pub fn extract_signed(psbt: &Psbt) -> Result<(String, String), String> {
     Ok((txid, serialize_hex(&tx)))
 }
 
+pub fn resolve_prevouts(
+    tx: &Transaction,
+    funding: &BTreeMap<Txid, Transaction>,
+) -> Result<Vec<TxOut>, String> {
+    tx.input
+        .iter()
+        .map(|input| {
+            let OutPoint { txid, vout } = input.previous_output;
+            funding
+                .get(&txid)
+                .and_then(|parent| parent.output.get(vout as usize))
+                .cloned()
+                .ok_or_else(|| format!("prevout {txid}:{vout} could not be resolved"))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedRaw {
+    pub txid: String,
+    pub tx_hex: String,
+    pub input_sats: u64,
+    pub fee_sats: u64,
+    pub dest: String,
+    pub complete: bool,
+}
+
+/// `prevouts[i]` is the output `tx.input[i]` spends.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_raw(
+    wallet: &Wallet,
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    owned: &BTreeMap<ScriptBuf, (ChainKind, u32)>,
+    book: &Lockbook,
+    allow: AllowLocked,
+    max_input_sats: u64,
+    auto_lock_sats: u64,
+) -> Result<SignedRaw, String> {
+    if prevouts.len() != tx.input.len() {
+        return Err("every input needs its prevout".into());
+    }
+    let spends: Vec<(OutPoint, u64, Scope)> = tx
+        .input
+        .iter()
+        .zip(prevouts)
+        .map(|(input, prevout)| {
+            let scope = if owned.contains_key(&prevout.script_pubkey) {
+                Scope::Wallet
+            } else {
+                Scope::Foreign
+            };
+            (input.previous_output, prevout.value.to_sat(), scope)
+        })
+        .collect();
+    let input_sats = spends
+        .iter()
+        .try_fold(0u64, |total, (_, value, _)| total.checked_add(*value))
+        .ok_or("input sum overflow")?;
+    enforce_input_cap(input_sats, max_input_sats)?;
+    refuse_locked(&spends, book, allow, auto_lock_sats)?;
+    if !spends.iter().any(|(_, _, scope)| *scope == Scope::Wallet) {
+        return Err("transaction spends no outputs from this wallet".into());
+    }
+    let output_sats = tx
+        .output
+        .iter()
+        .try_fold(0u64, |total, output| {
+            total.checked_add(output.value.to_sat())
+        })
+        .ok_or("output sum overflow")?;
+    let fee_sats = input_sats
+        .checked_sub(output_sats)
+        .ok_or("transaction outputs exceed inputs")?;
+    let secp = Secp256k1::new();
+    let mut cache = SighashCache::new(tx.clone());
+    for (index, prevout) in prevouts.iter().enumerate() {
+        let Some(&(chain, child)) = owned.get(&prevout.script_pubkey) else {
+            continue;
+        };
+        let derived = wallet.derive(chain, child)?;
+        let secret = wallet
+            .master_key()
+            .derive_priv(&secp, &derived.path)
+            .map_err(|_| "derivation path could not be derived".to_string())?
+            .private_key;
+        let witness = match wallet.script() {
+            ScriptKind::Bip84 => {
+                let sighash = cache
+                    .p2wpkh_signature_hash(
+                        index,
+                        &prevout.script_pubkey,
+                        prevout.value,
+                        EcdsaSighashType::All,
+                    )
+                    .map_err(|_| format!("input {index} could not be hashed"))?;
+                let signature = ecdsa::Signature {
+                    signature: secp
+                        .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &secret),
+                    sighash_type: EcdsaSighashType::All,
+                };
+                Witness::p2wpkh(&signature, &derived.public_key)
+            }
+            ScriptKind::Bip86 => {
+                let sighash = cache
+                    .taproot_key_spend_signature_hash(
+                        index,
+                        &Prevouts::All(prevouts),
+                        TapSighashType::Default,
+                    )
+                    .map_err(|_| format!("input {index} could not be hashed"))?;
+                let keypair = Keypair::from_secret_key(&secp, &secret)
+                    .tap_tweak(&secp, None)
+                    .to_keypair();
+                let signature = taproot::Signature {
+                    signature: secp
+                        .sign_schnorr(&Message::from_digest(sighash.to_byte_array()), &keypair),
+                    sighash_type: TapSighashType::Default,
+                };
+                Witness::p2tr_key_spend(&signature)
+            }
+        };
+        *cache
+            .witness_mut(index)
+            .ok_or_else(|| format!("input {index} has no witness"))? = witness;
+    }
+    let signed = cache.into_transaction();
+    Ok(SignedRaw {
+        txid: signed.compute_txid().to_string(),
+        tx_hex: serialize_hex(&signed),
+        input_sats,
+        fee_sats,
+        dest: external_dest(&signed, owned, wallet.network().bitcoin()),
+        complete: signed
+            .input
+            .iter()
+            .all(|input| !input.witness.is_empty() || !input.script_sig.is_empty()),
+    })
+}
+
 #[cfg(test)]
 pub fn verify_p2wpkh_witness(
     tx: &Transaction,
+    index: usize,
     input_value: u64,
     script_pubkey: &bitcoin::Script,
 ) -> Result<(), String> {
-    let witness = &tx.input[0].witness;
+    let witness = &tx.input[index].witness;
     if witness.len() != 2 {
         return Err("witness is missing".into());
     }
@@ -564,7 +785,7 @@ pub fn verify_p2wpkh_witness(
     let mut cache = SighashCache::new(tx);
     let sighash = cache
         .p2wpkh_signature_hash(
-            0,
+            index,
             script_pubkey,
             Amount::from_sat(input_value),
             signature.sighash_type,
@@ -578,6 +799,37 @@ pub fn verify_p2wpkh_witness(
 
 pub fn parse_txid(value: &str) -> Result<Txid, String> {
     Txid::from_str(value).map_err(|_| "utxo txid is invalid".to_string())
+}
+
+pub fn owned_scripts(
+    wallet: &Wallet,
+    cache: &ScanCache,
+    max_index: u32,
+    hinted: BTreeSet<(ChainKind, u32)>,
+) -> Result<BTreeMap<ScriptBuf, (ChainKind, u32)>, String> {
+    let extent = |used: &[u32]| {
+        used.iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(cache.receive_cursor)
+            .min(max_index)
+    };
+    let mut indexes = hinted;
+    for index in 0..=extent(&cache.used_external) {
+        indexes.insert((ChainKind::External, index));
+    }
+    for index in 0..=extent(&cache.used_change) {
+        indexes.insert((ChainKind::Change, index));
+    }
+    indexes
+        .into_iter()
+        .map(|(chain, index)| {
+            let derived = wallet.derive(chain, index)?;
+            Ok((derived.address.script_pubkey(), (chain, index)))
+        })
+        .collect()
 }
 
 pub fn indexes_from_origins(wallet: &Wallet, psbt: &Psbt) -> BTreeSet<(ChainKind, u32)> {
@@ -646,7 +898,13 @@ fn normal(child: &ChildNumber) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::locks::{InputSet, LockAction};
     use crate::wallet::{ChainKind, NetworkKind, ScriptKind, Wallet, BIP84_MNEMONIC};
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::XOnlyPublicKey;
+
+    const FOREIGN: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
     fn wallet(script: ScriptKind) -> Wallet {
         Wallet::open(BIP84_MNEMONIC.into(), NetworkKind::Mainnet, script, 0).unwrap()
     }
@@ -696,6 +954,325 @@ mod tests {
         }
     }
 
+    fn sign_unlocked(wallet: &Wallet, psbt: &mut Psbt, max_input_sats: u64) -> Result<u64, String> {
+        sign_psbt(
+            wallet,
+            psbt,
+            &Lockbook::default(),
+            AllowLocked::No,
+            max_input_sats,
+            330,
+        )
+    }
+
+    fn foreign_out(sats: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: Address::from_str(FOREIGN)
+                .unwrap()
+                .require_network(Network::Bitcoin)
+                .unwrap()
+                .script_pubkey(),
+        }
+    }
+
+    fn prevout_of(coin: &Coin) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(coin.value),
+            script_pubkey: coin.script_pubkey.clone(),
+        }
+    }
+
+    fn theirs(vout: u32) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_str(&format!("{:064x}", 0xf00)).unwrap(),
+            vout,
+        }
+    }
+
+    fn raw_tx(inputs: Vec<(OutPoint, Witness)>, output: Vec<TxOut>) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .into_iter()
+                .map(|(previous_output, witness)| TxIn {
+                    previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness,
+                })
+                .collect(),
+            output,
+        }
+    }
+
+    fn sign_with(
+        wallet: &Wallet,
+        tx: &Transaction,
+        prevouts: &[TxOut],
+        allow: AllowLocked,
+        max_input_sats: u64,
+    ) -> Result<SignedRaw, String> {
+        let owned = owned_scripts(wallet, &ScanCache::default(), 200, BTreeSet::new())?;
+        sign_raw(
+            wallet,
+            tx,
+            prevouts,
+            &owned,
+            &Lockbook::default(),
+            allow,
+            max_input_sats,
+            330,
+        )
+    }
+
+    fn decode(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).unwrap()).unwrap()
+    }
+
+    fn listed(coins: &[&Coin]) -> InputChoice {
+        let items: Vec<String> = coins
+            .iter()
+            .map(|coin| coin.outpoint().to_string())
+            .collect();
+        let items: Vec<&str> = items.iter().map(String::as_str).collect();
+        InputChoice::Exactly(InputSet::parse("inputs", &items).unwrap())
+    }
+
+    fn outpoints_of(coins: &[Coin]) -> Vec<OutPoint> {
+        coins.iter().map(Coin::outpoint).collect()
+    }
+
+    #[test]
+    fn automatic_send_skips_locked_coins_and_listed_inputs_limit_the_pool() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let charm = coin_at(&wallet, 0, 330);
+        let fuel = coin_at(&wallet, 1, 50_000);
+        let spare = coin_at(&wallet, 2, 60_000);
+        let every = vec![charm.clone(), fuel.clone(), spare.clone()];
+        let book = Lockbook::default();
+
+        let pool = coins_for_send(every.clone(), &InputChoice::Auto, &book, 330).unwrap();
+        assert_eq!(outpoints_of(&pool), vec![fuel.outpoint(), spare.outpoint()]);
+        assert_eq!(
+            coins_for_send(vec![charm.clone()], &InputChoice::Auto, &book, 330).unwrap_err(),
+            "no selectable utxos; locked outputs were skipped"
+        );
+
+        let pool = coins_for_send(every.clone(), &listed(&[&fuel, &charm]), &book, 330).unwrap();
+        assert_eq!(outpoints_of(&pool), vec![charm.outpoint(), fuel.outpoint()]);
+        let dest = wallet.derive(ChainKind::External, 5).unwrap().address;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let built = pay(&wallet, &pool, &dest, &change, 20_000, 2).unwrap();
+        let spent: Vec<OutPoint> = built
+            .psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect();
+        assert_eq!(spent, vec![fuel.outpoint()]);
+
+        let gone = coin_at(&wallet, 9, 1_000);
+        assert_eq!(
+            coins_for_send(every, &listed(&[&fuel, &gone]), &book, 330).unwrap_err(),
+            format!("input {} is not an unspent wallet output", gone.outpoint())
+        );
+    }
+
+    #[test]
+    fn sign_psbt_refuses_a_locked_input_unless_allowed() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&wallet, 0, 50_000);
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let mut psbt = pay(
+            &wallet,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            20_000,
+            2,
+        )
+        .unwrap()
+        .psbt;
+        let mut book = Lockbook::default();
+        let outpoint = coin.outpoint().to_string();
+        book.apply(
+            LockAction::Lock,
+            &InputSet::parse("outpoints", &[&outpoint]).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sign_psbt(&wallet, &mut psbt, &book, AllowLocked::No, 100_000, 330),
+            Err(format!(
+                "refusing to spend locked output {outpoint} (manual); pass allow_locked true to spend it"
+            ))
+        );
+        assert!(psbt.inputs[0].final_script_witness.is_none());
+        sign_psbt(&wallet, &mut psbt, &book, AllowLocked::Yes, 100_000, 330).unwrap();
+        let tx = psbt.extract_tx().unwrap();
+        verify_p2wpkh_witness(&tx, 0, coin.value, coin.script_pubkey.as_script()).unwrap();
+    }
+
+    #[test]
+    fn sign_raw_signs_a_p2wpkh_input_that_verifies() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&wallet, 0, 50_000);
+        let tx = raw_tx(
+            vec![(coin.outpoint(), Witness::new())],
+            vec![foreign_out(49_000)],
+        );
+        let signed =
+            sign_with(&wallet, &tx, &[prevout_of(&coin)], AllowLocked::No, 100_000).unwrap();
+        let decoded = decode(&signed.tx_hex);
+        verify_p2wpkh_witness(&decoded, 0, coin.value, coin.script_pubkey.as_script()).unwrap();
+        assert_eq!(signed.txid, tx.compute_txid().to_string());
+        assert_eq!(signed.input_sats, 50_000);
+        assert_eq!(signed.fee_sats, 1_000);
+        assert_eq!(signed.dest, FOREIGN);
+        assert!(signed.complete);
+    }
+
+    #[test]
+    fn sign_raw_signs_a_p2tr_key_spend_for_the_tweaked_output_key() {
+        let wallet = wallet(ScriptKind::Bip86);
+        let coin = coin_at(&wallet, 0, 40_000);
+        let tx = raw_tx(
+            vec![(coin.outpoint(), Witness::new())],
+            vec![foreign_out(39_000)],
+        );
+        let prevouts = [prevout_of(&coin)];
+        let signed = sign_with(&wallet, &tx, &prevouts, AllowLocked::No, 100_000).unwrap();
+        let decoded = decode(&signed.tx_hex);
+        let witness = &decoded.input[0].witness;
+        assert_eq!(witness.len(), 1);
+        assert_eq!(witness[0].len(), 64);
+        let signature = taproot::Signature::from_slice(&witness[0]).unwrap();
+        let sighash = SighashCache::new(&decoded)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        let output_key = XOnlyPublicKey::from_slice(&coin.script_pubkey.as_bytes()[2..]).unwrap();
+        Secp256k1::verification_only()
+            .verify_schnorr(
+                &signature.signature,
+                &Message::from_digest(sighash.to_byte_array()),
+                &output_key,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn sign_raw_leaves_the_foreign_witness_the_op_return_and_the_txid() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&wallet, 0, 50_000);
+        let foreign_witness = Witness::from_slice(&[vec![0xde, 0xad], vec![0xbe, 0xef]]);
+        let op_return = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([0x73, 0x70, 0x65, 0x6c]),
+        };
+        let tx = raw_tx(
+            vec![
+                (theirs(3), foreign_witness.clone()),
+                (coin.outpoint(), Witness::new()),
+            ],
+            vec![op_return.clone(), foreign_out(60_000)],
+        );
+        let prevouts = [foreign_out(20_000), prevout_of(&coin)];
+        let signed = sign_with(&wallet, &tx, &prevouts, AllowLocked::No, 100_000).unwrap();
+        let decoded = decode(&signed.tx_hex);
+        assert_eq!(decoded.input[0].witness, foreign_witness);
+        verify_p2wpkh_witness(&decoded, 1, coin.value, coin.script_pubkey.as_script()).unwrap();
+        assert_eq!(decoded.output, vec![op_return, foreign_out(60_000)]);
+        assert_eq!(signed.txid, tx.compute_txid().to_string());
+        assert_eq!(signed.fee_sats, 10_000);
+        assert!(signed.complete);
+    }
+
+    #[test]
+    fn sign_raw_counts_foreign_inputs_toward_the_cap() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&wallet, 0, 50_000);
+        let tx = raw_tx(
+            vec![
+                (theirs(0), Witness::new()),
+                (coin.outpoint(), Witness::new()),
+            ],
+            vec![foreign_out(90_000)],
+        );
+        let prevouts = [foreign_out(50_001), prevout_of(&coin)];
+        assert_eq!(
+            sign_with(&wallet, &tx, &prevouts, AllowLocked::No, 100_000),
+            Err("transaction inputs total 100001 sats, above MAX_TX_INPUT_SATS 100000".into())
+        );
+        let at_cap = sign_with(&wallet, &tx, &prevouts, AllowLocked::No, 100_001).unwrap();
+        assert_eq!(at_cap.input_sats, 100_001);
+        assert!(!at_cap.complete);
+    }
+
+    #[test]
+    fn sign_raw_refuses_a_locked_wallet_input_unless_allowed() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let charm = coin_at(&wallet, 0, 330);
+        let fuel = coin_at(&wallet, 1, 50_000);
+        let tx = raw_tx(
+            vec![
+                (charm.outpoint(), Witness::new()),
+                (fuel.outpoint(), Witness::new()),
+            ],
+            vec![foreign_out(330), foreign_out(49_000)],
+        );
+        let prevouts = [prevout_of(&charm), prevout_of(&fuel)];
+        assert_eq!(
+            sign_with(&wallet, &tx, &prevouts, AllowLocked::No, 100_000),
+            Err(format!(
+                "refusing to spend locked output {} (auto-small); pass allow_locked true to spend it",
+                charm.outpoint()
+            ))
+        );
+        let signed = sign_with(&wallet, &tx, &prevouts, AllowLocked::Yes, 100_000).unwrap();
+        let decoded = decode(&signed.tx_hex);
+        verify_p2wpkh_witness(&decoded, 0, 330, charm.script_pubkey.as_script()).unwrap();
+        verify_p2wpkh_witness(&decoded, 1, 50_000, fuel.script_pubkey.as_script()).unwrap();
+
+        let foreign_only = raw_tx(vec![(theirs(0), Witness::new())], vec![foreign_out(1_000)]);
+        assert_eq!(
+            sign_with(
+                &wallet,
+                &foreign_only,
+                &[foreign_out(2_000)],
+                AllowLocked::No,
+                100_000
+            ),
+            Err("transaction spends no outputs from this wallet".into())
+        );
+    }
+
+    #[test]
+    fn a_prevout_outside_the_funding_transactions_is_not_resolved() {
+        let funding = raw_tx(
+            vec![(theirs(0), Witness::new())],
+            vec![foreign_out(1_000), foreign_out(2_000)],
+        );
+        let txid = funding.compute_txid();
+        let parents = BTreeMap::from([(txid, funding)]);
+        let spend = |vout| raw_tx(vec![(OutPoint { txid, vout }, Witness::new())], vec![]);
+        assert_eq!(
+            resolve_prevouts(&spend(1), &parents),
+            Ok(vec![foreign_out(2_000)])
+        );
+        assert_eq!(
+            resolve_prevouts(&spend(2), &parents),
+            Err(format!("prevout {txid}:2 could not be resolved"))
+        );
+        assert_eq!(
+            resolve_prevouts(&spend(1), &BTreeMap::new()),
+            Err(format!("prevout {txid}:1 could not be resolved"))
+        );
+    }
+
     #[test]
     fn bip84_psbt_signs_and_the_witness_verifies() {
         let wallet = wallet(ScriptKind::Bip84);
@@ -722,11 +1299,11 @@ mod tests {
         assert!(unsigned.inputs[0].partial_sigs.is_empty());
 
         let mut signed = built.psbt.clone();
-        sign_psbt(&wallet, &mut signed, 100_000).unwrap();
+        sign_unlocked(&wallet, &mut signed, 100_000).unwrap();
         let (txid, _hex) = extract_signed(&signed).unwrap();
         assert_eq!(txid.len(), 64);
         let tx = signed.extract_tx().unwrap();
-        verify_p2wpkh_witness(&tx, coin.value, coin.script_pubkey.as_script()).unwrap();
+        verify_p2wpkh_witness(&tx, 0, coin.value, coin.script_pubkey.as_script()).unwrap();
         assert_eq!(tx.output[0].value.to_sat(), 20_000);
     }
 
@@ -746,7 +1323,7 @@ mod tests {
         )
         .unwrap();
         let mut signed = built.psbt.clone();
-        sign_psbt(&wallet, &mut signed, 100_000).unwrap();
+        sign_unlocked(&wallet, &mut signed, 100_000).unwrap();
         let (txid, _) = extract_signed(&signed).unwrap();
         assert_eq!(txid.len(), 64);
     }
@@ -787,14 +1364,14 @@ mod tests {
         )
         .unwrap()
         .psbt;
-        let err = sign_psbt(&wallet, &mut psbt, 49_999).unwrap_err();
+        let err = sign_unlocked(&wallet, &mut psbt, 49_999).unwrap_err();
         assert!(err.contains("MAX_TX_INPUT_SATS"));
         assert!(psbt.inputs[0].partial_sigs.is_empty());
-        sign_psbt(&wallet, &mut psbt, 50_000).unwrap();
+        sign_unlocked(&wallet, &mut psbt, 50_000).unwrap();
 
         psbt.inputs[0].witness_utxo = None;
         psbt.inputs[0].non_witness_utxo = None;
-        let err = sign_psbt(&wallet, &mut psbt, 100_000).unwrap_err();
+        let err = sign_unlocked(&wallet, &mut psbt, 100_000).unwrap_err();
         assert!(err.contains("missing a value"));
     }
 
@@ -856,7 +1433,7 @@ mod tests {
             .unwrap()
             .psbt;
             psbt.inputs[0].sighash_type = Some(sighash.into());
-            let err = sign_psbt(&segwit, &mut psbt, 100_000).unwrap_err();
+            let err = sign_unlocked(&segwit, &mut psbt, 100_000).unwrap_err();
             assert!(err.contains("not allowed"), "{err}");
             assert!(psbt.inputs[0].partial_sigs.is_empty());
         }
@@ -869,13 +1446,13 @@ mod tests {
             .unwrap()
             .psbt;
         allowed.inputs[0].sighash_type = Some(TapSighashType::All.into());
-        sign_psbt(&tap, &mut allowed, 100_000).unwrap();
+        sign_unlocked(&tap, &mut allowed, 100_000).unwrap();
 
         let mut rejected = pay(&tap, std::slice::from_ref(&coin), &dest, &change, 10_000, 1)
             .unwrap()
             .psbt;
         rejected.inputs[0].sighash_type = Some(TapSighashType::None.into());
-        assert!(sign_psbt(&tap, &mut rejected, 100_000)
+        assert!(sign_unlocked(&tap, &mut rejected, 100_000)
             .unwrap_err()
             .contains("not allowed"));
         assert!(rejected.inputs[0].tap_key_sig.is_none());
