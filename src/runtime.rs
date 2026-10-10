@@ -638,6 +638,7 @@ impl App<'_> {
         let (built, input_sats) = self
             .build_send(wallet, dest, sats, feerate, inputs, &book)
             .await?;
+        let book = self.locks().await?;
         let mut psbt = built.psbt;
         sign_psbt(
             wallet,
