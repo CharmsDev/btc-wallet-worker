@@ -2,8 +2,8 @@ use crate::auth::{verify_access_jwt, AccessRules, Clients};
 use crate::config::{Config, RawConfig};
 use crate::esplora::{
     classify_attempt, fold_broadcast, form_encode, parse_address_stats, parse_api_key,
-    parse_fee_estimates, parse_history_page, parse_token_response, parse_utxos, pick_feerate,
-    AddressStats, AttemptClass, BroadcastVerdict, RawAttempt, Utxo,
+    parse_fee_estimates, parse_funding_tx, parse_history_page, parse_token_response, parse_utxos,
+    pick_feerate, AddressStats, AttemptClass, BroadcastVerdict, RawAttempt, Utxo,
 };
 use crate::guard::{
     merge_scan, take_receive, GuardOp, GuardReply, OauthCache, SpendKind, SpendLog,
@@ -12,17 +12,21 @@ use crate::idempotency::{
     apply, body_key, client_message, Artifact, Body, Canon, Decision, Index, Op, RequestId, Slot,
     SpendFacts, WalletStamp, INDEX_KEY,
 };
+use crate::locks::{
+    AllowLocked, InputChoice, InputSet, LockAction, LockReason, Lockbook, LOCKS_KEY,
+};
 use crate::mcp::{self, Incoming, SendMode, ToolCall};
 use crate::policy::enforce_input_cap;
 use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
-    annotate_owned_inputs, build_payment, extract_signed, indexes_from_origins, inspect_psbt,
-    psbt_from_base64, psbt_to_base64, sign_psbt, transaction_input_sats, Built, Coin, Payment,
+    annotate_owned_inputs, build_payment, coins_for_send, extract_signed, indexes_from_origins,
+    inspect_psbt, owned_scripts, parse_raw_tx, psbt_from_base64, psbt_to_base64, resolve_prevouts,
+    sign_psbt, sign_raw, transaction_input_sats, utxo_rows, Built, Coin, Payment,
 };
 use crate::wallet::{parse_address, ChainKind, Wallet};
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Address, ScriptBuf};
+use bitcoin::{Address, Transaction, Txid};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,10 +115,17 @@ enum Effect {
         dest: Address,
         sats: u64,
         feerate: Option<u64>,
+        inputs: InputChoice,
     },
     Sign {
         psbt: Psbt,
         broadcast: bool,
+        allow_locked: AllowLocked,
+    },
+    SignTx {
+        tx: Transaction,
+        broadcast: bool,
+        allow_locked: AllowLocked,
     },
 }
 
@@ -125,19 +136,38 @@ impl App<'_> {
             ToolCall::Address { advance } => self.address(advance).await,
             ToolCall::History { limit } => self.history(limit).await,
             ToolCall::Utxos => self.utxos().await,
+            ToolCall::EditLocks {
+                action,
+                outpoints,
+                note,
+            } => self.edit_locks(action, outpoints, note).await,
             ToolCall::FeeEstimates => self.fee_estimates().await,
             ToolCall::Descriptor => self.descriptor(),
             ToolCall::Send {
                 to,
                 sats,
                 feerate,
+                inputs,
                 mode,
-            } => self.send(&to, sats, feerate, mode).await,
+            } => self.send(&to, sats, feerate, inputs, mode).await,
             ToolCall::SignPsbt {
                 psbt,
                 broadcast,
+                allow_locked,
                 request_id,
-            } => self.sign_psbt(&psbt, broadcast, request_id).await,
+            } => {
+                self.sign_psbt(&psbt, broadcast, allow_locked, request_id)
+                    .await
+            }
+            ToolCall::SignTx {
+                tx_hex,
+                broadcast,
+                allow_locked,
+                request_id,
+            } => {
+                self.sign_tx(&tx_hex, broadcast, allow_locked, request_id)
+                    .await
+            }
             ToolCall::SpendLog { limit } => self.spend_log(limit).await,
         }
     }
@@ -227,18 +257,45 @@ impl App<'_> {
     async fn utxos(&mut self) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let coins = self.collect_utxos(&wallet).await?;
-        let rows: Vec<Value> = coins
+        let book = self.locks().await?;
+        let rows = utxo_rows(
+            &coins,
+            &book,
+            self.config.auto_lock_sats,
+            wallet.script(),
+            wallet.network().bitcoin(),
+        )?;
+        Ok(json!({ "utxos": rows }))
+    }
+
+    async fn edit_locks(
+        &self,
+        action: LockAction,
+        outpoints: InputSet,
+        note: Option<String>,
+    ) -> Result<Value, String> {
+        let rows: Vec<Value> = outpoints
+            .outpoints()
             .iter()
-            .map(|coin| {
-                json!({
-                    "txid": coin.txid.to_string(),
-                    "vout": coin.vout,
-                    "value_sats": coin.value,
-                    "confirmed": coin.confirmed,
-                })
+            .map(|outpoint| match action {
+                LockAction::Lock => json!({
+                    "outpoint": outpoint.to_string(),
+                    "locked": true,
+                    "lock_reason": LockReason::Manual,
+                }),
+                LockAction::Unlock => json!({ "outpoint": outpoint.to_string(), "locked": false }),
             })
             .collect();
-        Ok(json!({ "utxos": rows }))
+        let op = GuardOp::EditLocks {
+            action,
+            outpoints,
+            note,
+        };
+        match guard_call(self.ctx, &op).await? {
+            GuardReply::LocksSaved => Ok(json!({ "outpoints": rows })),
+            GuardReply::Error { message } => Err(message),
+            _ => Err("spend guard returned an unexpected payload".into()),
+        }
     }
 
     async fn history(&mut self, limit: u32) -> Result<Value, String> {
@@ -324,25 +381,32 @@ impl App<'_> {
         to: &str,
         sats: u64,
         feerate: Option<u64>,
+        inputs: InputChoice,
         mode: SendMode,
     ) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let request_id = match mode {
-            SendMode::DryRun => return self.dry_run(&wallet, to, sats, feerate).await,
+            SendMode::DryRun => return self.dry_run(&wallet, to, sats, feerate, &inputs).await,
             SendMode::Broadcast { request_id } => request_id,
         };
         wallet.fingerprint_ok(self.config.expected_fingerprint)?;
         let dest = parse_address(to, self.config.network)?;
+        let listed = match &inputs {
+            InputChoice::Auto => None,
+            InputChoice::Exactly(set) => Some(set),
+        };
         let hash = Canon::send(
             &WalletStamp::of(&wallet),
             dest.script_pubkey().as_bytes(),
             sats,
             feerate,
+            listed,
         );
         let effect = Effect::Send {
             dest,
             sats,
             feerate,
+            inputs,
         };
         self.effect(&wallet, request_id, hash, effect).await
     }
@@ -353,9 +417,13 @@ impl App<'_> {
         to: &str,
         sats: u64,
         feerate: Option<u64>,
+        inputs: &InputChoice,
     ) -> Result<Value, String> {
         let dest = parse_address(to, self.config.network)?;
-        let (built, input_sats) = self.build_send(wallet, &dest, sats, feerate).await?;
+        let book = self.locks().await?;
+        let (built, input_sats) = self
+            .build_send(wallet, &dest, sats, feerate, inputs, &book)
+            .await?;
         Ok(json!({
             "broadcast": false,
             "signed": false,
@@ -373,6 +441,7 @@ impl App<'_> {
         &mut self,
         encoded: &str,
         broadcast: bool,
+        allow_locked: AllowLocked,
         request_id: RequestId,
     ) -> Result<Value, String> {
         let wallet = self.wallet()?;
@@ -382,8 +451,32 @@ impl App<'_> {
             &WalletStamp::of(&wallet),
             psbt.unsigned_tx.compute_txid().to_byte_array(),
             broadcast,
+            allow_locked,
         );
-        let effect = Effect::Sign { psbt, broadcast };
+        let effect = Effect::Sign {
+            psbt,
+            broadcast,
+            allow_locked,
+        };
+        self.effect(&wallet, request_id, hash, effect).await
+    }
+
+    async fn sign_tx(
+        &mut self,
+        tx_hex: &str,
+        broadcast: bool,
+        allow_locked: AllowLocked,
+        request_id: RequestId,
+    ) -> Result<Value, String> {
+        let wallet = self.wallet()?;
+        wallet.fingerprint_ok(self.config.expected_fingerprint)?;
+        let (raw, tx) = parse_raw_tx(tx_hex)?;
+        let hash = Canon::sign_tx(&WalletStamp::of(&wallet), &raw, broadcast, allow_locked);
+        let effect = Effect::SignTx {
+            tx,
+            broadcast,
+            allow_locked,
+        };
         self.effect(&wallet, request_id, hash, effect).await
     }
 
@@ -411,8 +504,21 @@ impl App<'_> {
                 dest,
                 sats,
                 feerate,
-            } => self.sign_send(wallet, &dest, sats, feerate).await,
-            Effect::Sign { psbt, broadcast } => self.sign_foreign(wallet, psbt, broadcast).await,
+                inputs,
+            } => self.sign_send(wallet, &dest, sats, feerate, &inputs).await,
+            Effect::Sign {
+                psbt,
+                broadcast,
+                allow_locked,
+            } => {
+                self.sign_foreign(wallet, psbt, broadcast, allow_locked)
+                    .await
+            }
+            Effect::SignTx {
+                tx,
+                broadcast,
+                allow_locked,
+            } => self.sign_raw_tx(wallet, tx, broadcast, allow_locked).await,
         };
         let artifact = match signed {
             Ok(artifact) => artifact,
@@ -490,8 +596,15 @@ impl App<'_> {
         dest: &Address,
         sats: u64,
         feerate: Option<u64>,
+        inputs: &InputChoice,
+        book: &Lockbook,
     ) -> Result<(Built, u64), String> {
-        let coins = self.collect_utxos(wallet).await?;
+        let coins = coins_for_send(
+            self.collect_utxos(wallet).await?,
+            inputs,
+            book,
+            self.config.auto_lock_sats,
+        )?;
         let feerate = match feerate {
             Some(rate) => rate,
             None => self.chosen_feerate().await?,
@@ -519,10 +632,22 @@ impl App<'_> {
         dest: &Address,
         sats: u64,
         feerate: Option<u64>,
+        inputs: &InputChoice,
     ) -> Result<Artifact, String> {
-        let (built, input_sats) = self.build_send(wallet, dest, sats, feerate).await?;
+        let book = self.locks().await?;
+        let (built, input_sats) = self
+            .build_send(wallet, dest, sats, feerate, inputs, &book)
+            .await?;
+        let book = self.locks().await?;
         let mut psbt = built.psbt;
-        sign_psbt(wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        sign_psbt(
+            wallet,
+            &mut psbt,
+            &book,
+            inputs.allow_locked(),
+            self.config.max_tx_input_sats,
+            self.config.auto_lock_sats,
+        )?;
         let (txid, raw_tx_hex) = extract_signed(&psbt)?;
         let response = json!({
             "broadcast": true,
@@ -553,11 +678,17 @@ impl App<'_> {
         wallet: &Wallet,
         mut psbt: Psbt,
         broadcast: bool,
+        allow_locked: AllowLocked,
     ) -> Result<Artifact, String> {
         let input_sats = transaction_input_sats(&psbt)?;
         enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
         let (cache, _, _) = self.discover(wallet).await?;
-        let owned = owned_scripts(wallet, &cache, &psbt, self.config.max_scan_index)?;
+        let owned = owned_scripts(
+            wallet,
+            &cache,
+            self.config.max_scan_index,
+            indexes_from_origins(wallet, &psbt),
+        )?;
         annotate_owned_inputs(wallet, &mut psbt, &owned)?;
         let inspection = inspect_psbt(
             &psbt,
@@ -565,7 +696,15 @@ impl App<'_> {
             self.config.script,
             self.config.network.bitcoin(),
         )?;
-        sign_psbt(wallet, &mut psbt, self.config.max_tx_input_sats)?;
+        let book = self.locks().await?;
+        sign_psbt(
+            wallet,
+            &mut psbt,
+            &book,
+            allow_locked,
+            self.config.max_tx_input_sats,
+            self.config.auto_lock_sats,
+        )?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let response = json!({
             "broadcast": broadcast,
@@ -600,6 +739,83 @@ impl App<'_> {
             txid,
             facts,
         })
+    }
+
+    async fn sign_raw_tx(
+        &mut self,
+        wallet: &Wallet,
+        tx: Transaction,
+        broadcast: bool,
+        allow_locked: AllowLocked,
+    ) -> Result<Artifact, String> {
+        let (cache, _, _) = self.discover(wallet).await?;
+        let owned = owned_scripts(wallet, &cache, self.config.max_scan_index, BTreeSet::new())?;
+        let funding = self.funding_txs(&tx).await?;
+        let prevouts = resolve_prevouts(&tx, &funding)?;
+        let book = self.locks().await?;
+        let signed = sign_raw(
+            wallet,
+            &tx,
+            &prevouts,
+            &owned,
+            &book,
+            allow_locked,
+            self.config.max_tx_input_sats,
+            self.config.auto_lock_sats,
+        )?;
+        if broadcast && !signed.complete {
+            return Err("transaction is not fully signed".into());
+        }
+        let response = json!({
+            "broadcast": broadcast,
+            "signed": true,
+            "txid": signed.txid,
+            "tx_hex": signed.tx_hex,
+            "input_sats": signed.input_sats,
+            "fee_sats": signed.fee_sats,
+            "dest": signed.dest,
+        });
+        let facts = SpendFacts {
+            kind: SpendKind::SignTx,
+            input_sats: signed.input_sats,
+            dest: signed.dest,
+            fee_sats: signed.fee_sats,
+        };
+        if !broadcast {
+            return Ok(Artifact::SignedOnly {
+                response,
+                txid: signed.txid,
+                facts,
+            });
+        }
+        Ok(Artifact::Broadcast {
+            raw_tx_hex: signed.tx_hex,
+            response,
+            txid: signed.txid,
+            facts,
+        })
+    }
+
+    async fn funding_txs(
+        &mut self,
+        tx: &Transaction,
+    ) -> Result<BTreeMap<Txid, Transaction>, String> {
+        let mut funding = BTreeMap::new();
+        for input in &tx.input {
+            let txid = input.previous_output.txid;
+            if funding.contains_key(&txid) {
+                continue;
+            }
+            let body = self
+                .esplora_get(&format!("/tx/{txid}/hex"))
+                .await
+                .map_err(|err| {
+                    let vout = input.previous_output.vout;
+                    format!("prevout {txid}:{vout} could not be resolved: {err}")
+                })?;
+            funding.insert(txid, parse_funding_tx(&body, txid)?);
+        }
+        Ok(funding)
     }
 
     async fn idempotency(&self, call: Op) -> Result<Decision, String> {
@@ -744,6 +960,14 @@ impl App<'_> {
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {
         match guard_call(self.ctx, &GuardOp::GetScan).await? {
             GuardReply::Scan { cache } => Ok(cache),
+            GuardReply::Error { message } => Err(message),
+            _ => Err("spend guard returned an unexpected payload".into()),
+        }
+    }
+
+    async fn locks(&self) -> Result<Lockbook, String> {
+        match guard_call(self.ctx, &GuardOp::GetLocks).await? {
+            GuardReply::Locks { book } => Ok(book),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
         }
@@ -939,43 +1163,6 @@ fn coin_from(wallet: &Wallet, chain: ChainKind, index: u32, utxo: Utxo) -> Resul
     })
 }
 
-fn owned_scripts(
-    wallet: &Wallet,
-    cache: &ScanCache,
-    psbt: &Psbt,
-    max_index: u32,
-) -> Result<BTreeMap<ScriptBuf, (ChainKind, u32)>, String> {
-    let mut indexes = BTreeMap::<ChainKind, BTreeSet<u32>>::new();
-    let extent = |used: &[u32]| {
-        used.iter()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(cache.receive_cursor)
-    };
-    for index in 0..=extent(&cache.used_external).min(max_index) {
-        indexes
-            .entry(ChainKind::External)
-            .or_default()
-            .insert(index);
-    }
-    for index in 0..=extent(&cache.used_change).min(max_index) {
-        indexes.entry(ChainKind::Change).or_default().insert(index);
-    }
-    for (chain, index) in indexes_from_origins(wallet, psbt) {
-        indexes.entry(chain).or_default().insert(index);
-    }
-    let mut owned = BTreeMap::new();
-    for (chain, set) in indexes {
-        for index in set {
-            let derived = wallet.derive(chain, index)?;
-            owned.insert(derived.address.script_pubkey(), (chain, index));
-        }
-    }
-    Ok(owned)
-}
-
 fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
     let raw = RawConfig {
         network: var_string(ctx, "NETWORK"),
@@ -986,6 +1173,7 @@ fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
         max_chain_calls: var_string(ctx, "MAX_CHAIN_CALLS"),
         fee_target_blocks: var_string(ctx, "FEE_TARGET_BLOCKS"),
         max_tx_input_sats: var_string(ctx, "MAX_TX_INPUT_SATS"),
+        auto_lock_sats: var_string(ctx, "AUTO_LOCK_SATS"),
         idempotency_ttl_hours: var_string(ctx, "IDEMPOTENCY_TTL_HOURS"),
         esplora_urls: var_string(ctx, "ESPLORA_URLS"),
         expected_fingerprint: var_string(ctx, "EXPECTED_FINGERPRINT"),
@@ -1196,12 +1384,58 @@ impl DurableObject for SpendGuard {
                     .await?;
                 GuardReply::OauthMiss
             }
+            GuardOp::GetLocks => match self.state.storage().get::<Lockbook>(LOCKS_KEY).await {
+                Ok(book) => GuardReply::Locks {
+                    book: book.unwrap_or_default(),
+                },
+                Err(err) => GuardReply::Error {
+                    message: format!("stored locks could not be read: {err}"),
+                },
+            },
+            GuardOp::EditLocks {
+                action,
+                outpoints,
+                note,
+            } => match self.edit_locks(action, outpoints, note).await {
+                Ok(reply) => reply,
+                Err(err) => GuardReply::Error {
+                    message: format!("stored locks could not be updated: {err}"),
+                },
+            },
         };
         reply(&reply_body)
     }
 }
 
 impl SpendGuard {
+    async fn edit_locks(
+        &self,
+        action: LockAction,
+        outpoints: InputSet,
+        note: Option<String>,
+    ) -> Result<GuardReply> {
+        let slot = Rc::new(RefCell::new(None));
+        let slot_write = slot.clone();
+        self.state
+            .storage()
+            .transaction(move |tx| async move {
+                let mut book: Lockbook = load_or_default(&tx, LOCKS_KEY).await?;
+                let edited = book.apply(action, &outpoints, note);
+                if edited.is_ok() {
+                    tx.put(LOCKS_KEY, &book).await?;
+                }
+                *slot_write.borrow_mut() = Some(edited);
+                Ok(())
+            })
+            .await?;
+        let outcome = slot.borrow_mut().take();
+        match outcome {
+            Some(Ok(())) => Ok(GuardReply::LocksSaved),
+            Some(Err(message)) => Ok(GuardReply::Error { message }),
+            None => Err(worker::Error::from("lock edit failed".to_string())),
+        }
+    }
+
     async fn idempotency(&self, op: Op) -> Result<GuardReply> {
         let now = Date::now().as_millis();
         let decided = Rc::new(RefCell::new(None));

@@ -1,4 +1,5 @@
 use crate::idempotency::{Decision, Op};
+use crate::locks::{InputSet, LockAction, Lockbook};
 use crate::scan::{allocate_receive, merge_used, ScanCache};
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,7 @@ const MAX_LOG_BYTES: usize = 1024 * 1024;
 pub enum SpendKind {
     Send,
     Sign,
+    SignTx,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +110,12 @@ pub enum GuardOp {
         access_token: String,
         exp_ms: u64,
     },
+    GetLocks,
+    EditLocks {
+        action: LockAction,
+        outpoints: InputSet,
+        note: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +127,8 @@ pub enum GuardReply {
     ReceiveIndex { index: u32 },
     Oauth { access_token: String, exp_ms: u64 },
     OauthMiss,
+    Locks { book: Lockbook },
+    LocksSaved,
     Error { message: String },
 }
 
@@ -161,6 +171,36 @@ mod tests {
             id: format!("send:{txid}:{at_ms}"),
             request_id: "invoice-8841".into(),
         }
+    }
+
+    #[test]
+    fn old_sign_rows_still_parse_and_sign_tx_rows_name_their_signer() {
+        let mut row = serde_json::to_value(record(&"aa".repeat(32), 10)).unwrap();
+        row["kind"] = "sign".into();
+        assert_eq!(
+            serde_json::from_value::<SpendRecord>(row).unwrap().kind,
+            SpendKind::Sign
+        );
+        assert_eq!(
+            serde_json::to_value(SpendKind::SignTx).unwrap(),
+            serde_json::json!("sign_tx")
+        );
+    }
+
+    #[test]
+    fn a_lock_edit_survives_the_json_hop_to_the_durable_object() {
+        let outpoint = format!("{}:0", "aa".repeat(32));
+        let op = GuardOp::EditLocks {
+            action: LockAction::Lock,
+            outpoints: InputSet::parse("outpoints", &[&outpoint]).unwrap(),
+            note: Some("charm".into()),
+        };
+        let wire = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "op": "edit_locks", "action": "lock", "outpoints": [outpoint], "note": "charm" })
+        );
+        assert_eq!(serde_json::from_value::<GuardOp>(wire).unwrap(), op);
     }
 
     #[test]

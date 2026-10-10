@@ -5,6 +5,7 @@ mod config;
 mod esplora;
 mod guard;
 mod idempotency;
+mod locks;
 mod mcp;
 mod policy;
 mod scan;
