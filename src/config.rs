@@ -30,6 +30,7 @@ pub struct Config {
     pub max_chain_calls: u32,
     pub fee_target_blocks: u32,
     pub max_tx_input_sats: u64,
+    pub auto_lock_sats: u64,
     pub idempotency_ttl_ms: u64,
     pub expected_fingerprint: Option<Fingerprint>,
     pub backends: Vec<Backend>,
@@ -46,6 +47,7 @@ pub struct RawConfig {
     pub max_chain_calls: String,
     pub fee_target_blocks: String,
     pub max_tx_input_sats: String,
+    pub auto_lock_sats: String,
     pub idempotency_ttl_hours: String,
     pub esplora_urls: String,
     pub expected_fingerprint: String,
@@ -87,6 +89,7 @@ impl Config {
         if max_tx_input_sats == 0 {
             return Err("MAX_TX_INPUT_SATS must be greater than zero".into());
         }
+        let auto_lock_sats = parse_u64(&raw.auto_lock_sats, 330, "AUTO_LOCK_SATS")?;
         let idempotency_ttl_hours = bounded(
             parse_u32(&raw.idempotency_ttl_hours, 168, "IDEMPOTENCY_TTL_HOURS")?,
             24,
@@ -109,6 +112,7 @@ impl Config {
             max_chain_calls,
             fee_target_blocks,
             max_tx_input_sats,
+            auto_lock_sats,
             idempotency_ttl_ms: u64::from(idempotency_ttl_hours) * HOUR_MS,
             expected_fingerprint,
             backends,
@@ -195,6 +199,24 @@ mod tests {
         );
         raw.access_aud.clear();
         assert!(Config::from_raw(&raw).is_err());
+    }
+
+    #[test]
+    fn auto_lock_defaults_to_330_sats_and_zero_is_allowed() {
+        let auto_lock = |sats: &str| {
+            Config::from_raw(&RawConfig {
+                auto_lock_sats: sats.into(),
+                ..RawConfig::default()
+            })
+            .map(|config| config.auto_lock_sats)
+        };
+        assert_eq!(auto_lock(""), Ok(330));
+        assert_eq!(auto_lock("0"), Ok(0));
+        assert_eq!(auto_lock(" 546 "), Ok(546));
+        assert_eq!(
+            auto_lock("small"),
+            Err("AUTO_LOCK_SATS must be an integer".into())
+        );
     }
 
     #[test]

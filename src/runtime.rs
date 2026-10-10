@@ -986,6 +986,7 @@ fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
         max_chain_calls: var_string(ctx, "MAX_CHAIN_CALLS"),
         fee_target_blocks: var_string(ctx, "FEE_TARGET_BLOCKS"),
         max_tx_input_sats: var_string(ctx, "MAX_TX_INPUT_SATS"),
+        auto_lock_sats: var_string(ctx, "AUTO_LOCK_SATS"),
         idempotency_ttl_hours: var_string(ctx, "IDEMPOTENCY_TTL_HOURS"),
         esplora_urls: var_string(ctx, "ESPLORA_URLS"),
         expected_fingerprint: var_string(ctx, "EXPECTED_FINGERPRINT"),
