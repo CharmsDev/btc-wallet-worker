@@ -1,5 +1,5 @@
 use crate::idempotency::{Decision, Op};
-use crate::locks::Lockbook;
+use crate::locks::{InputSet, LockAction, Lockbook};
 use crate::scan::{allocate_receive, merge_used, ScanCache};
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +111,11 @@ pub enum GuardOp {
         exp_ms: u64,
     },
     GetLocks,
+    EditLocks {
+        action: LockAction,
+        outpoints: InputSet,
+        note: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +128,7 @@ pub enum GuardReply {
     Oauth { access_token: String, exp_ms: u64 },
     OauthMiss,
     Locks { book: Lockbook },
+    LocksSaved,
     Error { message: String },
 }
 
@@ -179,6 +185,22 @@ mod tests {
             serde_json::to_value(SpendKind::SignTx).unwrap(),
             serde_json::json!("sign_tx")
         );
+    }
+
+    #[test]
+    fn a_lock_edit_survives_the_json_hop_to_the_durable_object() {
+        let outpoint = format!("{}:0", "aa".repeat(32));
+        let op = GuardOp::EditLocks {
+            action: LockAction::Lock,
+            outpoints: InputSet::parse("outpoints", &[&outpoint]).unwrap(),
+            note: Some("charm".into()),
+        };
+        let wire = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "op": "edit_locks", "action": "lock", "outpoints": [outpoint], "note": "charm" })
+        );
+        assert_eq!(serde_json::from_value::<GuardOp>(wire).unwrap(), op);
     }
 
     #[test]

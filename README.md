@@ -53,6 +53,7 @@ Vars live in `wrangler.toml`. Secrets are set with `wrangler secret put` and are
 | `MAX_CHAIN_CALLS` | var | `80` | Esplora calls allowed in one tool call |
 | `FEE_TARGET_BLOCKS` | var | `3` | Confirmation target when `feerate` is omitted |
 | `MAX_TX_INPUT_SATS` | var | `100000` | Max sum of all input values in one transaction |
+| `AUTO_LOCK_SATS` | var | `330` | Wallet coins at or under this value are locked until `unlock`. `0` locks no coin with a positive value. A value that is not a whole number is a config error |
 | `IDEMPOTENCY_TTL_HOURS` | var | `168` | Hours a `request_id` keeps its signed transaction. Must be 24 to 168. A value outside that range is a config error |
 | `ESPLORA_URLS` | var | empty | Comma-separated Esplora bases. Empty uses the defaults below |
 | `EXPECTED_FINGERPRINT` | var | empty | 8 hex characters. When set, signing is refused if the seed does not match |
@@ -81,13 +82,19 @@ Fee estimates are rounded up to the next whole sat/vB.
 
 The endpoint is `POST /mcp`. The body is one JSON-RPC 2.0 message. The server is stateless and returns `application/json`. Supported protocol versions are `2025-06-18`, `2025-03-26`, and `2024-11-05`.
 
-Tools: `balance`, `address`, `history`, `utxos`, `fee_estimates`, `descriptor`, `send`, `sign_psbt`, `spend_log`.
+Tools: `balance`, `address`, `history`, `utxos`, `lock`, `unlock`, `fee_estimates`, `descriptor`, `send`, `sign_psbt`, `sign_tx`, `spend_log`.
 
-`send` and `sign_psbt` default to `broadcast: false`. `send` then returns the fee, vsize, outputs, input sum, and an unsigned PSBT. It signs and broadcasts only when `broadcast` is `true`. `sign_psbt` signs only when every input has a known value and the input sum is within `MAX_TX_INPUT_SATS`. `broadcast: true` on `sign_psbt` also submits the transaction.
+`send`, `sign_psbt`, and `sign_tx` default to `broadcast: false`. `send` then returns the fee, vsize, outputs, input sum, and an unsigned PSBT. It signs and broadcasts only when `broadcast` is `true`. `sign_psbt` signs only when every input has a known value and the input sum is within `MAX_TX_INPUT_SATS`. `broadcast: true` on `sign_psbt` also submits the transaction.
 
-Every call that signs needs a `request_id`. That is `send` with `broadcast: true`, and every `sign_psbt` call. A `request_id` is 1 to 80 letters, digits, or `.` `_` `:` `-`. Use a new one for each payment. A dry-run `send` checks the format of a `request_id` and then ignores it.
+`sign_tx` takes a consensus-hex transaction in `tx_hex` and returns the signed hex in `tx_hex`. It signs only the inputs that spend this wallet's outputs. Every other input and every output stay byte for byte as sent, including an `OP_RETURN`. It fetches the transaction behind each input from Esplora to learn the value that input spends, and refuses a fetched transaction that does not hash to its txid. A prevout it cannot fetch is an error, and nothing is signed. `broadcast: true` on `sign_tx` submits the transaction only when every input is signed.
 
-To retry after an error or a lost reply, send the same arguments with the same `request_id`. Satchel returns the stored result. If no broadcast of the stored transaction was confirmed, it broadcasts that same transaction again. A retry does not select coins or sign a second time. For `sign_psbt`, the arguments that count are the unsigned transaction and `broadcast`.
+Every call that signs needs a `request_id`. That is `send` with `broadcast: true`, and every `sign_psbt` and `sign_tx` call. A `request_id` is 1 to 80 letters, digits, or `.` `_` `:` `-`. Use a new one for each payment. A dry-run `send` checks the format of a `request_id` and then ignores it.
+
+To retry after an error or a lost reply, send the same arguments with the same `request_id`. Satchel returns the stored result. If no broadcast of the stored transaction was confirmed, it broadcasts that same transaction again. A retry does not select coins or sign a second time. The arguments that count:
+
+- `send` counts `to`, `sats`, and `feerate`, plus the set of `inputs` when present. The order of `inputs` does not matter. A `send` without `inputs` is the same request it was before coin control.
+- `sign_psbt` counts the unsigned transaction and `broadcast`, plus `allow_locked` when it is `true`.
+- `sign_tx` counts the exact transaction bytes, `broadcast`, and `allow_locked`. A changed witness is a new request.
 
 - The same `request_id` with different arguments is an error.
 - A retry that arrives while the first call is still signing gets an in-progress error. Wait and retry with the same arguments.
@@ -132,6 +139,16 @@ Claude Desktop or Claude Code:
 
 Any other Streamable HTTP client uses the same URL and headers. Missing or wrong auth returns HTTP 401. `GET /` returns only the service name. `GET /mcp` returns 405.
 
+## Coin control
+
+`utxos` lists each coin with its address, `script_pubkey` in hex, `script_type` (`p2wpkh` or `p2tr`), and `path` (`0/<index>` on the receive chain, `1/<index>` on change). A locked coin has `locked: true` and a `lock_reason` of `manual` or `auto-small`. An unlocked coin has `locked: false` and no `lock_reason`.
+
+- A wallet coin at or under `AUTO_LOCK_SATS` (default 330) is locked until you `unlock` it. Outputs this small often carry an asset such as an inscription or a charm, and spending one as fee fuel destroys the asset. `0` locks no coin with a positive value. The threshold is read on every call, so a new value applies to every coin at once.
+- `lock` and `unlock` take `outpoints` as `txid:vout` strings and an optional `note` of up to 200 characters. Calling either twice is the same as calling it once. The last call for an outpoint wins. An outpoint does not need to be a wallet coin. The lock book holds at most 2048 outpoints. A call that would pass that adds none of its outpoints, and rewriting an outpoint already in the book still works.
+- The `lock` and `unlock` reply shows only what was stored. Auto-lock depends on a coin's value, which those tools do not look up. `utxos` shows it.
+- `send` without `inputs` skips locked coins. If every coin is locked, it says so. With `inputs`, only the listed coins are considered, and they may be locked. Listing a coin is consent to spend it. Selection may still leave a listed coin unspent. A listed outpoint that is not a current wallet coin is an error. To spend an exact set, build the transaction yourself and call `sign_tx`.
+- `sign_psbt` and `sign_tx` refuse to spend a locked outpoint unless `allow_locked` is `true`. The error names every locked input. Auto-lock applies to this wallet's outputs only. A manual lock applies to any outpoint in the book, including one this wallet does not own. A foreign output under the threshold is not auto-locked.
+
 ## Access
 
 Use two checks.
@@ -145,11 +162,13 @@ To revoke one agent, remove its name from `MCP_CLIENT_TOKENS` and run `wrangler 
 
 The worker is a hot wallet. A stolen bearer token, a stolen Access service token, or a bug in an agent can spend the coins this wallet can sign. Keep the balance small.
 
-The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every input in the transaction must be within that number, for `send` and for `sign_psbt`. `send` skips a coin that would push the selection over that cap and tries a smaller set, so a large coin does not block a payment a smaller coin can fund. `sign_psbt` refuses a PSBT when any input has no `witness_utxo` and no `non_witness_utxo`. The check runs before a signature is created. There is no rolling daily cap, no feerate cap, and no separate fee cap. A fee cannot exceed the inputs, so the input cap is also the most one transaction can lose.
+The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every input in the transaction must be within that number, for `send`, `sign_psbt`, and `sign_tx`. Inputs this wallet does not own count toward the sum. `send` skips a coin that would push the selection over that cap and tries a smaller set, so a large coin does not block a payment a smaller coin can fund. `sign_psbt` refuses a PSBT when any input has no `witness_utxo` and no `non_witness_utxo`. `sign_tx` refuses a transaction when any prevout cannot be fetched. The check runs before a signature is created. There is no rolling daily cap, no feerate cap, and no separate fee cap. A fee cannot exceed the inputs, so the input cap is also the most one transaction can lose.
+
+Locks guard coins against an accidental spend. They are not a spend limit. A caller can pass `allow_locked: true` or list a locked coin in `send` `inputs`. The lock check runs after the input cap and before a signature is created.
 
 Signing allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected.
 
-The Durable Object stores the signed transaction for each `request_id`, so a retry can return it or broadcast it again. It does not approve or refuse an amount.
+The Durable Object stores the signed transaction for each `request_id`, so a retry can return it or broadcast it again. It does not approve or refuse an amount. It also stores the lock book under one key. A `lock` or `unlock` loads, edits, and stores that book in one transaction, so two concurrent edits cannot drop each other's marks.
 
 The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, `request_id`, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped, and at most 500 rows are kept. A destination longer than 240 characters is stored shortened. If the note would exceed 1 MiB of JSON, the oldest rows are dropped so the write stays under the Durable Object's 2 MB key-and-value cap. That bound is not a spend limit. The log does not block a second transaction. The row is written in the same Durable Object transaction that stores the signed transaction for the `request_id`, so a retry with the same key does not add a second row. If that transaction fails, nothing is broadcast.
 
@@ -184,4 +203,4 @@ cargo test
 worker-build --release
 ```
 
-`cargo test` covers the BIP84 and BIP86 vectors for the mnemonic `abandon abandon ... about` with an empty passphrase, address network checks, cap accounting, fee checks, a PSBT sign round trip, bearer comparison, Access JWT verification, and MCP JSON-RPC. GitHub Actions runs the same checks and the wasm build. This environment cannot deploy the worker.
+`cargo test` covers the BIP84 and BIP86 vectors for the mnemonic `abandon abandon ... about` with an empty passphrase, address network checks, cap accounting, fee checks, a PSBT sign round trip, lock verdicts and refusals, raw transaction signing for P2WPKH and P2TR, pinned idempotency hashes, bearer comparison, Access JWT verification, and MCP JSON-RPC. GitHub Actions runs the same checks and the wasm build. This environment cannot deploy the worker.

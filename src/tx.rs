@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
-use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bitcoin::hashes::Hash;
 use bitcoin::key::{Keypair, TapTweak};
 use bitcoin::psbt::Psbt;
@@ -17,6 +17,7 @@ use bitcoin::{
     ecdsa, taproot, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxOut, Txid, Witness,
 };
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
@@ -79,6 +80,45 @@ pub fn coins_for_send(
                 .collect()
         }
     }
+}
+
+pub fn utxo_rows(
+    coins: &[Coin],
+    book: &Lockbook,
+    auto_lock_sats: u64,
+    script: ScriptKind,
+    network: Network,
+) -> Result<Vec<Value>, String> {
+    let script_type = match script {
+        ScriptKind::Bip84 => "p2wpkh",
+        ScriptKind::Bip86 => "p2tr",
+    };
+    coins
+        .iter()
+        .map(|coin| {
+            let address = Address::from_script(&coin.script_pubkey, network)
+                .map_err(|_| "utxo script has no address".to_string())?;
+            let [.., chain, index] = coin.path.as_ref() else {
+                return Err("utxo path is too short".into());
+            };
+            let reason = book.reason(coin.outpoint(), coin.value, Scope::Wallet, auto_lock_sats);
+            let mut row = json!({
+                "txid": coin.txid.to_string(),
+                "vout": coin.vout,
+                "value_sats": coin.value,
+                "confirmed": coin.confirmed,
+                "address": address.to_string(),
+                "script_pubkey": hex::encode(coin.script_pubkey.as_bytes()),
+                "script_type": script_type,
+                "path": format!("{chain}/{index}"),
+                "locked": reason.is_some(),
+            });
+            if let Some(reason) = reason {
+                row["lock_reason"] = json!(reason);
+            }
+            Ok(row)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -627,6 +667,16 @@ pub fn extract_signed(psbt: &Psbt) -> Result<(String, String), String> {
     Ok((txid, serialize_hex(&tx)))
 }
 
+/// Returns the decoded bytes too, because the idempotency hash covers them exactly.
+pub fn parse_raw_tx(tx_hex: &str) -> Result<(Vec<u8>, Transaction), String> {
+    if tx_hex.len() > 256_000 {
+        return Err("transaction is too large".into());
+    }
+    let raw = hex::decode(tx_hex.trim()).map_err(|_| "tx_hex is not hex")?;
+    let tx = deserialize(&raw).map_err(|_| "tx_hex could not be decoded")?;
+    Ok((raw, tx))
+}
+
 pub fn resolve_prevouts(
     tx: &Transaction,
     funding: &BTreeMap<Txid, Transaction>,
@@ -900,7 +950,6 @@ mod tests {
     use super::*;
     use crate::locks::{InputSet, LockAction};
     use crate::wallet::{ChainKind, NetworkKind, ScriptKind, Wallet, BIP84_MNEMONIC};
-    use bitcoin::consensus::encode::deserialize;
     use bitcoin::XOnlyPublicKey;
 
     const FOREIGN: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -1271,6 +1320,97 @@ mod tests {
             resolve_prevouts(&spend(1), &BTreeMap::new()),
             Err(format!("prevout {txid}:1 could not be resolved"))
         );
+    }
+
+    #[test]
+    fn utxo_rows_show_the_lock_verdict_and_where_each_coin_lives() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let charm = coin_at(&wallet, 0, 330);
+        let fuel = coin_at(&wallet, 1, 50_000);
+        let derived = wallet.derive(ChainKind::Change, 0).unwrap();
+        let change = Coin {
+            txid: Txid::from_str(&format!("{:064x}", 0xc0)).unwrap(),
+            vout: 2,
+            value: 60_000,
+            script_pubkey: derived.address.script_pubkey(),
+            path: derived.path,
+            public_key: derived.public_key,
+            confirmed: false,
+        };
+        let mut book = Lockbook::default();
+        let fuel_outpoint = fuel.outpoint().to_string();
+        book.apply(
+            LockAction::Lock,
+            &InputSet::parse("outpoints", &[&fuel_outpoint]).unwrap(),
+            None,
+        )
+        .unwrap();
+        let rows = utxo_rows(
+            &[charm.clone(), fuel.clone(), change.clone()],
+            &book,
+            330,
+            ScriptKind::Bip84,
+            Network::Bitcoin,
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                json!({
+                    "txid": charm.txid.to_string(),
+                    "vout": 0,
+                    "value_sats": 330,
+                    "confirmed": true,
+                    "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+                    "script_pubkey": "0014c0cebcd6c3d3ca8c75dc5ec62ebe55330ef910e2",
+                    "script_type": "p2wpkh",
+                    "path": "0/0",
+                    "locked": true,
+                    "lock_reason": "auto-small",
+                }),
+                json!({
+                    "txid": fuel.txid.to_string(),
+                    "vout": 0,
+                    "value_sats": 50_000,
+                    "confirmed": true,
+                    "address": "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g",
+                    "script_pubkey": "00149c90f934ea51fa0f6504177043e0908da6929983",
+                    "script_type": "p2wpkh",
+                    "path": "0/1",
+                    "locked": true,
+                    "lock_reason": "manual",
+                }),
+                json!({
+                    "txid": change.txid.to_string(),
+                    "vout": 2,
+                    "value_sats": 60_000,
+                    "confirmed": false,
+                    "address": "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el",
+                    "script_pubkey": "00143e34985dca6fddc9fb369940e4c7d8e2873f529c",
+                    "script_type": "p2wpkh",
+                    "path": "1/0",
+                    "locked": false,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_tx_hex_must_decode_to_exactly_one_transaction() {
+        let tx = raw_tx(
+            vec![(theirs(0), Witness::from_slice(&[[0xde]]))],
+            vec![foreign_out(1_000)],
+        );
+        let tx_hex = serialize_hex(&tx);
+        assert_eq!(
+            parse_raw_tx(&tx_hex),
+            Ok((hex::decode(&tx_hex).unwrap(), tx))
+        );
+        assert_eq!(
+            parse_raw_tx(&format!("{tx_hex}00")),
+            Err("tx_hex could not be decoded".into())
+        );
+        assert_eq!(parse_raw_tx("zz"), Err("tx_hex is not hex".into()));
     }
 
     #[test]

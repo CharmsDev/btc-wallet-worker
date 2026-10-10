@@ -1,9 +1,10 @@
 use crate::idempotency::RequestId;
-use crate::locks::{AllowLocked, InputChoice, InputSet};
+use crate::locks::{AllowLocked, InputChoice, InputSet, LockAction};
 use serde_json::{json, Value};
 
 pub const PROTOCOL: &str = "2025-06-18";
 const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+const MAX_NOTE_CHARS: usize = 200;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SendMode {
@@ -21,6 +22,11 @@ pub enum ToolCall {
         limit: u32,
     },
     Utxos,
+    EditLocks {
+        action: LockAction,
+        outpoints: InputSet,
+        note: Option<String>,
+    },
     FeeEstimates,
     Descriptor,
     Send {
@@ -32,6 +38,12 @@ pub enum ToolCall {
     },
     SignPsbt {
         psbt: String,
+        broadcast: bool,
+        allow_locked: AllowLocked,
+        request_id: RequestId,
+    },
+    SignTx {
+        tx_hex: String,
         broadcast: bool,
         allow_locked: AllowLocked,
         request_id: RequestId,
@@ -139,7 +151,7 @@ fn initialize_result(id: &Value, params: Option<&Value>) -> Value {
             "protocolVersion": version,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "satchel", "title": "Satchel", "version": "0.1.0" },
-            "instructions": "Satchel is a hot Bitcoin wallet. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt always signs, even when broadcast is false, and the returned PSBT can be broadcast elsewhere. Every call that signs needs a request_id. That is send with broadcast true, and every sign_psbt call. Use a new request_id for each new payment. To retry after an error or a lost reply, call again with the same arguments and the same request_id. Satchel then returns the stored result or rebroadcasts the same transaction, and it does not sign a second one. The same request_id with different arguments is an error. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS."
+            "instructions": "Satchel is a hot Bitcoin wallet. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt and sign_tx always sign, even when broadcast is false, and the returned transaction can be broadcast elsewhere. Every call that signs needs a request_id. That is send with broadcast true, and every sign_psbt and sign_tx call. Use a new request_id for each new payment. To retry after an error or a lost reply, call again with the same arguments and the same request_id. Satchel then returns the stored result or rebroadcasts the same transaction, and it does not sign a second one. The same request_id with different arguments is an error. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS. Coins at or under AUTO_LOCK_SATS start locked, and lock and unlock change that. utxos shows which coins are locked. send without inputs skips locked coins. Listing coins in send inputs allows spending them even when locked. sign_psbt and sign_tx refuse to spend a locked output unless allow_locked is true."
         }),
     )
 }
@@ -166,6 +178,8 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
             limit: u32_arg(&args, "limit", 10, 1, 25)?,
         }),
         "utxos" => Ok(ToolCall::Utxos),
+        "lock" => edit_locks(&args, LockAction::Lock),
+        "unlock" => edit_locks(&args, LockAction::Unlock),
         "fee_estimates" => Ok(ToolCall::FeeEstimates),
         "descriptor" => Ok(ToolCall::Descriptor),
         "send" => Ok(ToolCall::Send {
@@ -180,6 +194,12 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
             broadcast: bool_arg(&args, "broadcast", false)?,
             allow_locked: allow_locked_arg(&args)?,
             request_id: required_request_id(&args, "request_id is required for sign_psbt")?,
+        }),
+        "sign_tx" => Ok(ToolCall::SignTx {
+            tx_hex: string_arg(&args, "tx_hex")?,
+            broadcast: bool_arg(&args, "broadcast", false)?,
+            allow_locked: allow_locked_arg(&args)?,
+            request_id: required_request_id(&args, "request_id is required for sign_tx")?,
         }),
         "spend_log" => Ok(ToolCall::SpendLog {
             limit: u32_arg(&args, "limit", 50, 1, 200)?,
@@ -254,6 +274,28 @@ fn optional_feerate(args: &Value) -> Result<Option<u64>, String> {
             Ok(Some(ceil as u64))
         }
         _ => Err("feerate must be a number of sat/vB".into()),
+    }
+}
+
+fn edit_locks(args: &Value, action: LockAction) -> Result<ToolCall, String> {
+    Ok(ToolCall::EditLocks {
+        action,
+        outpoints: outpoints_arg(args, "outpoints")?,
+        note: note_arg(args)?,
+    })
+}
+
+fn note_arg(args: &Value) -> Result<Option<String>, String> {
+    match args.get("note") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(note)) => {
+            let note = note.trim();
+            if note.chars().count() > MAX_NOTE_CHARS {
+                return Err(format!("note must be at most {MAX_NOTE_CHARS} characters"));
+            }
+            Ok(Some(note.to_string()).filter(|note| !note.is_empty()))
+        }
+        _ => Err("note must be a string".into()),
     }
 }
 
@@ -341,7 +383,23 @@ fn tool_specs() -> Vec<Value> {
             "type": "object",
             "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 25 } }
         })),
-        tool("utxos", "Unspent outputs known to the wallet.", json!({ "type": "object", "properties": {} })),
+        tool("utxos", "Unspent outputs known to the wallet, with lock state. A coin at or under AUTO_LOCK_SATS shows locked with lock_reason auto-small until unlock. A coin passed to lock shows lock_reason manual.", json!({ "type": "object", "properties": {} })),
+        tool("lock", "Lock outpoints. send without inputs skips them, and sign_psbt and sign_tx refuse to spend them unless allow_locked is true. An outpoint does not need to be a wallet coin. Locking twice is the same as locking once. The reply shows only what lock stored. Auto-lock depends on a coin's value, which this tool does not look up, so check utxos for it.", json!({
+            "type": "object",
+            "required": ["outpoints"],
+            "properties": {
+                "outpoints": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "txid:vout outpoints." },
+                "note": { "type": "string", "maxLength": 200 }
+            }
+        })),
+        tool("unlock", "Unlock outpoints, including coins auto-locked at or under AUTO_LOCK_SATS. They stay selectable until lock. Unlocking twice is the same as unlocking once. The reply shows only what unlock stored. Auto-lock depends on a coin's value, which this tool does not look up, so check utxos for it.", json!({
+            "type": "object",
+            "required": ["outpoints"],
+            "properties": {
+                "outpoints": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "txid:vout outpoints." },
+                "note": { "type": "string", "maxLength": 200 }
+            }
+        })),
         tool("fee_estimates", "Esplora fee estimates in sat/vB.", json!({ "type": "object", "properties": {} })),
         tool("descriptor", "Public account descriptors and the master fingerprint.", json!({ "type": "object", "properties": {} })),
         tool("send", "Build a payment. Dry-run unless broadcast is true. With broadcast true it signs and broadcasts, and request_id is required. Without inputs, coin selection skips locked coins. With inputs, only the listed coins are considered, they may be locked, and selection may leave a listed coin unspent. To retry, send the same arguments with the same request_id. Satchel returns the stored result or rebroadcasts the same transaction, and it does not sign a second one.", json!({
@@ -380,6 +438,22 @@ fn tool_specs() -> Vec<Value> {
                 }
             }
         })),
+        tool("sign_tx", "Sign a consensus-hex transaction. It signs only inputs that spend this wallet's outputs, and leaves every other input and every output, including OP_RETURN, unchanged. It fetches the transaction behind every prevout to learn its value. The input sum must be within MAX_TX_INPUT_SATS. It refuses to spend a locked output unless allow_locked is true. Broadcast only when broadcast is true, and only when every input is signed. request_id is required. To retry, send the same hex, broadcast flag, and allow_locked with the same request_id. Satchel returns the stored transaction and does not sign again.", json!({
+            "type": "object",
+            "required": ["tx_hex", "request_id"],
+            "properties": {
+                "tx_hex": { "type": "string", "description": "Consensus-serialized transaction in hex." },
+                "broadcast": { "type": "boolean" },
+                "allow_locked": {
+                    "type": "boolean",
+                    "description": "Set true to sign inputs that spend locked outputs. Default false."
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "Required. Use one per transaction, 1-80 letters, digits, or . _ : -. Reuse it only to retry the same hex, broadcast flag, and allow_locked."
+                }
+            }
+        })),
         tool("spend_log", "Recent signed transactions. No secrets.", json!({
             "type": "object",
             "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 200 } }
@@ -412,7 +486,8 @@ mod tests {
                 assert_eq!(body["result"]["serverInfo"]["name"], "satchel");
                 let instructions = body["result"]["instructions"].as_str().unwrap();
                 assert!(instructions.contains("send defaults to an unsigned dry run"));
-                assert!(instructions.contains("sign_psbt always signs"));
+                assert!(instructions.contains("sign_psbt and sign_tx always sign"));
+                assert!(instructions.contains("unless allow_locked is true"));
                 assert!(!instructions.contains("sign_psbt default"));
             }
             other => panic!("expected reply, got {other:?}"),
@@ -433,10 +508,13 @@ mod tests {
                         "address",
                         "history",
                         "utxos",
+                        "lock",
+                        "unlock",
                         "fee_estimates",
                         "descriptor",
                         "send",
                         "sign_psbt",
+                        "sign_tx",
                         "spend_log"
                     ]
                 );
@@ -525,6 +603,28 @@ mod tests {
             )),
             "request_id is required for sign_psbt"
         );
+        assert_eq!(
+            invalid_params(call(
+                "sign_tx",
+                json!({ "tx_hex": "0200", "broadcast": false })
+            )),
+            "request_id is required for sign_tx"
+        );
+        match call(
+            "sign_tx",
+            json!({ "tx_hex": " 0200 ", "allow_locked": true, "request_id": "join-4" }),
+        ) {
+            Incoming::Call { call, .. } => assert_eq!(
+                call,
+                ToolCall::SignTx {
+                    tx_hex: "0200".into(),
+                    broadcast: false,
+                    allow_locked: AllowLocked::Yes,
+                    request_id: RequestId::parse("join-4").unwrap(),
+                }
+            ),
+            other => panic!("expected call, got {other:?}"),
+        }
         match call(
             "send",
             json!({ "to": "bc1qtest", "sats": 1500, "broadcast": true, "request_id": " invoice-8841 " }),
@@ -625,6 +725,52 @@ mod tests {
         assert_eq!(
             send_with(json!(["nope"])),
             "inputs entry nope is not a txid:vout outpoint"
+        );
+    }
+
+    #[test]
+    fn lock_and_unlock_take_outpoints_and_a_trimmed_note() {
+        let outpoint = format!("{}:7", "cc".repeat(32));
+        let set = InputSet::parse("outpoints", &[&outpoint]).unwrap();
+        match call(
+            "lock",
+            json!({ "outpoints": [outpoint], "note": "  inscription  " }),
+        ) {
+            Incoming::Call { call, .. } => assert_eq!(
+                call,
+                ToolCall::EditLocks {
+                    action: LockAction::Lock,
+                    outpoints: set.clone(),
+                    note: Some("inscription".into()),
+                }
+            ),
+            other => panic!("expected call, got {other:?}"),
+        }
+        match call("unlock", json!({ "outpoints": [outpoint], "note": "   " })) {
+            Incoming::Call { call, .. } => assert_eq!(
+                call,
+                ToolCall::EditLocks {
+                    action: LockAction::Unlock,
+                    outpoints: set,
+                    note: None,
+                }
+            ),
+            other => panic!("expected call, got {other:?}"),
+        }
+        assert_eq!(
+            invalid_params(call("lock", json!({}))),
+            "outpoints must be a list of txid:vout strings"
+        );
+        assert_eq!(
+            invalid_params(call("lock", json!({ "outpoints": [] }))),
+            "outpoints must list at least one outpoint"
+        );
+        assert_eq!(
+            invalid_params(call(
+                "lock",
+                json!({ "outpoints": [outpoint], "note": "n".repeat(201) })
+            )),
+            "note must be at most 200 characters"
         );
     }
 
