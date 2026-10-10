@@ -1,6 +1,7 @@
 ---
 title: A retry must load the stored transaction before it selects coins
 date: 2026-10-09
+last_updated: 2026-10-10
 category: architecture-patterns
 module: idempotency
 problem_type: architecture_pattern
@@ -22,7 +23,7 @@ tags:
 
 ## Guidance
 
-`App::effect` sends `Op::Begin` before `sign_send` or `sign_foreign`. Those are the only paths that scan addresses and select coins. When `Begin` returns a stored transaction, `settle` broadcasts that hex or returns the stored result. It does not call `build_payment`.
+`App::effect` sends `Op::Begin` before `sign_send`, `sign_foreign`, or `sign_raw_tx`. Those are the only paths that scan addresses, fetch prevouts, or select coins. When `Begin` returns a stored transaction, `settle` broadcasts that hex or returns the stored result. It does not call `build_payment` or `sign_raw`.
 
 The claim is empty until `Commit`. A second caller that arrives while the claim is live gets `InProgress` and does not sign. After the signed transaction is stored, a retry rebroadcasts those bytes. Esplora answers that the transaction is already in the mempool count as success.
 
@@ -38,6 +39,8 @@ The claim is empty until `Commit`. A second caller that arrives while the claim 
 ## Examples
 
 A repeated `send` with the same `request_id`, destination, amount, and requested feerate returns the stored txid. The feerate that went into the hash is the client's argument. The estimate filled in when that argument was omitted is not part of the hash, so a later estimate does not mint a second transaction.
+
+`Canon::send` appends the input set only when `inputs` is present. `Canon::sign` appends a byte only when `allow_locked` is true. A retry that omits those arguments still matches a hash stored before the fields existed. A different preimage is `Mismatch`, and `Mismatch` does not rebroadcast the stored transaction. `Canon::sign_tx` is a separate kind. It hashes the raw transaction bytes, so a witness added by another signer is a different request and needs its own `request_id`.
 
 ## Related
 

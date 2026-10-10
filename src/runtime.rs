@@ -268,8 +268,6 @@ impl App<'_> {
         Ok(json!({ "utxos": rows }))
     }
 
-    /// Reports the stored mark, not the verdict. Auto-lock needs a coin's value,
-    /// and an outpoint passed here may not be a wallet coin at all.
     async fn edit_locks(
         &self,
         action: LockAction,
@@ -1409,8 +1407,6 @@ impl DurableObject for SpendGuard {
 }
 
 impl SpendGuard {
-    /// Load, edit, and store in one transaction so two concurrent edits cannot
-    /// drop each other's marks.
     async fn edit_locks(
         &self,
         action: LockAction,

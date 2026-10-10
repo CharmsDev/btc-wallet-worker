@@ -667,7 +667,6 @@ pub fn extract_signed(psbt: &Psbt) -> Result<(String, String), String> {
     Ok((txid, serialize_hex(&tx)))
 }
 
-/// Returns the decoded bytes too, because the idempotency hash covers them exactly.
 pub fn parse_raw_tx(tx_hex: &str) -> Result<(Vec<u8>, Transaction), String> {
     if tx_hex.len() > 256_000 {
         return Err("transaction is too large".into());
@@ -1003,6 +1002,21 @@ mod tests {
         }
     }
 
+    fn psbt_for(coin: &Coin, wallet: Option<&Wallet>) -> Psbt {
+        let tx = raw_tx(
+            vec![(coin.outpoint(), Witness::new())],
+            vec![foreign_out(coin.value - 100)],
+        );
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(prevout_of(coin));
+        if let Some(wallet) = wallet {
+            psbt.inputs[0]
+                .bip32_derivation
+                .insert(coin.public_key, (wallet.fingerprint(), coin.path.clone()));
+        }
+        psbt
+    }
+
     fn sign_unlocked(wallet: &Wallet, psbt: &mut Psbt, max_input_sats: u64) -> Result<u64, String> {
         sign_psbt(
             wallet,
@@ -1164,6 +1178,72 @@ mod tests {
         sign_psbt(&wallet, &mut psbt, &book, AllowLocked::Yes, 100_000, 330).unwrap();
         let tx = psbt.extract_tx().unwrap();
         verify_p2wpkh_witness(&tx, 0, coin.value, coin.script_pubkey.as_script()).unwrap();
+    }
+
+    #[test]
+    fn sign_psbt_auto_lock_follows_the_bip32_origin() {
+        let wallet = wallet(ScriptKind::Bip84);
+        let coin = coin_at(&wallet, 0, 330);
+        let mut owned = psbt_for(&coin, Some(&wallet));
+        assert_eq!(
+            sign_psbt(
+                &wallet,
+                &mut owned,
+                &Lockbook::default(),
+                AllowLocked::No,
+                100_000,
+                330
+            ),
+            Err(format!(
+                "refusing to spend locked output {} (auto-small); pass allow_locked true to spend it",
+                coin.outpoint()
+            ))
+        );
+        assert!(owned.inputs[0].final_script_witness.is_none());
+
+        let mut allowed = psbt_for(&coin, Some(&wallet));
+        sign_psbt(
+            &wallet,
+            &mut allowed,
+            &Lockbook::default(),
+            AllowLocked::Yes,
+            100_000,
+            330,
+        )
+        .unwrap();
+        let tx = allowed.extract_tx().unwrap();
+        verify_p2wpkh_witness(&tx, 0, 330, coin.script_pubkey.as_script()).unwrap();
+
+        let mut bare = psbt_for(&coin, None);
+        assert_eq!(
+            sign_psbt(
+                &wallet,
+                &mut bare,
+                &Lockbook::default(),
+                AllowLocked::No,
+                100_000,
+                330
+            ),
+            Ok(330)
+        );
+        assert!(bare.inputs[0].partial_sigs.is_empty());
+        assert!(bare.inputs[0].final_script_witness.is_none());
+
+        let mut book = Lockbook::default();
+        let outpoint = coin.outpoint().to_string();
+        book.apply(
+            LockAction::Lock,
+            &InputSet::parse("outpoints", &[&outpoint]).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut marked = psbt_for(&coin, None);
+        assert_eq!(
+            sign_psbt(&wallet, &mut marked, &book, AllowLocked::No, 100_000, 330),
+            Err(format!(
+                "refusing to spend locked output {outpoint} (manual); pass allow_locked true to spend it"
+            ))
+        );
     }
 
     #[test]

@@ -143,7 +143,7 @@ Any other Streamable HTTP client uses the same URL and headers. Missing or wrong
 
 `utxos` lists each coin with its address, `script_pubkey` in hex, `script_type` (`p2wpkh` or `p2tr`), and `path` (`0/<index>` on the receive chain, `1/<index>` on change). A locked coin has `locked: true` and a `lock_reason` of `manual` or `auto-small`. An unlocked coin has `locked: false` and no `lock_reason`.
 
-- A wallet coin at or under `AUTO_LOCK_SATS` (default 330) is locked until you `unlock` it. Outputs this small often carry an asset such as an inscription or a charm, and spending one as fee fuel destroys the asset. `0` locks no coin with a positive value. The threshold is read on every call, so a new value applies to every coin at once.
+- A wallet coin at or under `AUTO_LOCK_SATS` (default 330) is locked until you `unlock` it. Charm-bearing outputs are often this small, and a charm spell itself sits in an `OP_RETURN` of a transaction you build and pass to `sign_tx`. Automatic selection skips the small output so a normal payment does not spend it. `0` locks no coin with a positive value. The threshold is read on every call, so a new value applies to every coin at once.
 - `lock` and `unlock` take `outpoints` as `txid:vout` strings and an optional `note` of up to 200 characters. Calling either twice is the same as calling it once. The last call for an outpoint wins. An outpoint does not need to be a wallet coin. The lock book holds at most 2048 outpoints. A call that would pass that adds none of its outpoints, and rewriting an outpoint already in the book still works.
 - The `lock` and `unlock` reply shows only what was stored. Auto-lock depends on a coin's value, which those tools do not look up. `utxos` shows it.
 - `send` without `inputs` skips locked coins. If every coin is locked, it says so. With `inputs`, only the listed coins are considered, and they may be locked. Listing a coin is consent to spend it. Selection may still leave a listed coin unspent. A listed outpoint that is not a current wallet coin is an error. To spend an exact set, build the transaction yourself and call `sign_tx`.
@@ -166,7 +166,7 @@ The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every 
 
 Locks guard coins against an accidental spend. They are not a spend limit. A caller can pass `allow_locked: true` or list a locked coin in `send` `inputs`. The lock check runs after the input cap and before a signature is created.
 
-Signing allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. Addresses that are not for `NETWORK` are rejected.
+`sign_psbt` allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. `sign_tx` writes `SIGHASH_ALL` on segwit inputs and `SIGHASH_DEFAULT` on taproot inputs. Addresses that are not for `NETWORK` are rejected.
 
 The Durable Object stores the signed transaction for each `request_id`, so a retry can return it or broadcast it again. It does not approve or refuse an amount. It also stores the lock book under one key. A `lock` or `unlock` loads, edits, and stores that book in one transaction, so two concurrent edits cannot drop each other's marks.
 

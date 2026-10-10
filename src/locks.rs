@@ -5,11 +5,8 @@ use std::fmt;
 use std::str::FromStr;
 
 pub const LOCKS_KEY: &str = "locks";
-/// Bounds the stored book well under the Durable Object's 2 MB value cap.
 const MAX_MARKS: usize = 2048;
 
-/// Iterates in `OutPoint` order, so the order a client lists outpoints in never
-/// reaches a hash.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]
 pub struct InputSet(BTreeSet<OutPoint>);
@@ -57,7 +54,6 @@ pub enum InputChoice {
 }
 
 impl InputChoice {
-    /// Listing a coin in `inputs` is consent to spend it while it is locked.
     pub fn allow_locked(&self) -> AllowLocked {
         match self {
             Self::Auto => AllowLocked::No,
@@ -101,8 +97,6 @@ pub enum LockAction {
     Unlock,
 }
 
-/// Holds only what `lock` and `unlock` said. Auto-lock is decided from the live
-/// value on every read, so a changed AUTO_LOCK_SATS applies to every coin at once.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<Entry>", into = "Vec<Entry>")]
 pub struct Lockbook {
@@ -116,8 +110,6 @@ enum Mark {
 }
 
 impl Lockbook {
-    /// Auto-lock covers only wallet outputs. A small foreign prevout is another
-    /// party's coin, so only a manual mark can lock it.
     pub fn reason(
         &self,
         outpoint: OutPoint,
@@ -159,7 +151,6 @@ impl Lockbook {
     }
 }
 
-/// `bitcoin` is built without its serde feature, so outpoints are stored as `txid:vout`.
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     outpoint: String,

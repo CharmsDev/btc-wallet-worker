@@ -148,8 +148,7 @@ pub struct Canon([u8; 32]);
 
 impl Canon {
     /// `feerate` is the client's argument, not the estimate a build substitutes,
-    /// so a retry after estimates move is the same request. Omitted `inputs`
-    /// writes nothing, so a send without them keeps the hash it had before locks.
+    /// so a retry after estimates move is the same request.
     pub fn send(
         wallet: &WalletStamp,
         script_pubkey: &[u8],
@@ -180,7 +179,6 @@ impl Canon {
         Self::digest(&bytes)
     }
 
-    /// `AllowLocked::No` writes nothing, so it keeps the hash a sign had before locks.
     pub fn sign(
         wallet: &WalletStamp,
         unsigned_txid: [u8; 32],
@@ -197,7 +195,6 @@ impl Canon {
         Self::digest(&bytes)
     }
 
-    /// Hashes the client's bytes, not the txid, so a changed witness is a new request.
     pub fn sign_tx(
         wallet: &WalletStamp,
         raw_tx: &[u8],

@@ -169,7 +169,6 @@ pub fn parse_utxos(body: &str) -> Result<Vec<Utxo>, String> {
         .collect())
 }
 
-/// The txid check is what lets a signer trust a prevout value from a public backend.
 pub fn parse_funding_tx(body: &str, expected: Txid) -> Result<Transaction, String> {
     let bytes =
         hex::decode(body.trim()).map_err(|_| format!("transaction {expected} was not hex"))?;
