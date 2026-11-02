@@ -1,5 +1,5 @@
-use crate::chain::{NetworkKind, ScriptKind};
-use crate::esplora::{plan_backends, Backend};
+use crate::chain::{Chain, ChainChoice, NetworkKind, ScriptKind};
+use crate::esplora::{plan_backends, plan_litecoin_backends, Backend};
 use crate::wallet::parse_fingerprint;
 use bitcoin::bip32::Fingerprint;
 
@@ -23,7 +23,7 @@ impl AccessSpec {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub network: NetworkKind,
+    network: NetworkKind,
     pub script: ScriptKind,
     pub account: u32,
     pub gap_limit: u32,
@@ -34,7 +34,8 @@ pub struct Config {
     pub auto_lock_sats: u64,
     pub idempotency_ttl_ms: u64,
     pub expected_fingerprint: Option<Fingerprint>,
-    pub backends: Vec<Backend>,
+    bitcoin_backends: Vec<Backend>,
+    litecoin_backends: Vec<Backend>,
     pub access: Option<AccessSpec>,
 }
 
@@ -51,6 +52,7 @@ pub struct RawConfig {
     pub auto_lock_sats: String,
     pub idempotency_ttl_hours: String,
     pub esplora_urls: String,
+    pub litecoin_esplora_urls: String,
     pub expected_fingerprint: String,
     pub access_team_domain: String,
     pub access_aud: String,
@@ -102,7 +104,8 @@ impl Config {
         } else {
             Some(parse_fingerprint(&raw.expected_fingerprint)?)
         };
-        let backends = plan_backends(network, &raw.esplora_urls, raw.have_blockstream_key)?;
+        let bitcoin_backends = plan_backends(network, &raw.esplora_urls, raw.have_blockstream_key)?;
+        let litecoin_backends = plan_litecoin_backends(&raw.litecoin_esplora_urls)?;
         let access = access_spec(&raw.access_team_domain, &raw.access_aud)?;
         Ok(Self {
             network,
@@ -116,9 +119,21 @@ impl Config {
             auto_lock_sats,
             idempotency_ttl_ms: u64::from(idempotency_ttl_hours) * HOUR_MS,
             expected_fingerprint,
-            backends,
+            bitcoin_backends,
+            litecoin_backends,
             access,
         })
+    }
+
+    pub fn chain(&self, choice: ChainChoice) -> Chain {
+        choice.resolve(self.network)
+    }
+
+    pub fn backends(&self, chain: Chain) -> &[Backend] {
+        match chain {
+            Chain::Bitcoin(_) => &self.bitcoin_backends,
+            Chain::Litecoin => &self.litecoin_backends,
+        }
     }
 }
 
@@ -171,13 +186,23 @@ mod tests {
     #[test]
     fn defaults_are_mainnet_bip84_with_the_input_cap() {
         let config = Config::from_raw(&RawConfig::default()).unwrap();
-        assert_eq!(config.network, NetworkKind::Mainnet);
+        assert_eq!(
+            config.chain(ChainChoice::Configured),
+            Chain::Bitcoin(NetworkKind::Mainnet)
+        );
         assert_eq!(config.script, ScriptKind::Bip84);
         assert_eq!(config.gap_limit, 20);
         assert_eq!(config.max_tx_input_sats, 100_000);
         assert!(config.expected_fingerprint.is_none());
         assert!(config.access.is_none());
-        assert_eq!(config.backends.len(), 2);
+        assert_eq!(
+            config.backends(Chain::Bitcoin(NetworkKind::Mainnet)).len(),
+            2
+        );
+        let litecoin = config.backends(Chain::Litecoin);
+        assert_eq!(litecoin.len(), 1);
+        assert_eq!(litecoin[0].base, "https://litecoinspace.org/api");
+        assert!(!litecoin[0].oauth);
     }
 
     #[test]
@@ -192,7 +217,11 @@ mod tests {
             ..RawConfig::default()
         };
         let config = Config::from_raw(&raw).unwrap();
-        assert_eq!(config.network, NetworkKind::Signet);
+        assert_eq!(
+            config.chain(ChainChoice::Configured),
+            Chain::Bitcoin(NetworkKind::Signet)
+        );
+        assert_eq!(config.chain(ChainChoice::Litecoin), Chain::Litecoin);
         assert_eq!(config.script, ScriptKind::Bip86);
         assert_eq!(
             config.access.unwrap().jwks_url(),
@@ -238,5 +267,23 @@ mod tests {
                 Err("IDEMPOTENCY_TTL_HOURS must be between 24 and 168".into())
             );
         }
+    }
+
+    #[test]
+    fn litecoin_esplora_list_stays_off_oauth_when_a_blockstream_key_is_set() {
+        let config = Config::from_raw(&RawConfig {
+            litecoin_esplora_urls: "https://enterprise.blockstream.info/api".into(),
+            have_blockstream_key: true,
+            ..RawConfig::default()
+        })
+        .unwrap();
+        let litecoin = config.backends(Chain::Litecoin);
+        assert_eq!(litecoin.len(), 1);
+        assert_eq!(litecoin[0].base, "https://enterprise.blockstream.info/api");
+        assert!(!litecoin[0].oauth);
+        assert!(config
+            .backends(Chain::Bitcoin(NetworkKind::Mainnet))
+            .iter()
+            .any(|backend| backend.oauth));
     }
 }

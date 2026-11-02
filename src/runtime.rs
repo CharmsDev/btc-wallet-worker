@@ -1,4 +1,5 @@
 use crate::auth::{verify_access_jwt, AccessRules, Clients};
+use crate::chain::{Chain, ObjectName, PayTo};
 use crate::config::{Config, RawConfig};
 use crate::esplora::{
     classify_attempt, fold_broadcast, form_encode, parse_address_stats, parse_api_key,
@@ -19,14 +20,15 @@ use crate::mcp::{self, Incoming, SendMode, ToolCall};
 use crate::policy::enforce_input_cap;
 use crate::scan::{history_indexes, next_probe, ProbeStep, ScanCache};
 use crate::tx::{
-    annotate_owned_inputs, build_payment, coins_for_send, extract_signed, indexes_from_origins,
-    inspect_psbt, owned_scripts, parse_raw_tx, psbt_from_base64, psbt_to_base64, resolve_prevouts,
-    sign_psbt, sign_raw, transaction_input_sats, utxo_rows, Built, Coin, Payment,
+    annotate_owned_inputs, build_payment, classify_parents, coins_for_send, extract_signed,
+    indexes_from_origins, inspect_psbt, owned_scripts, parse_raw_tx, psbt_from_base64,
+    psbt_to_base64, resolve_prevouts, sign_psbt, sign_raw, transaction_input_sats, utxo_rows,
+    Built, Coin, ParentPlan, Payment,
 };
-use crate::wallet::{parse_address, ChainKind, Wallet};
+use crate::wallet::{ChainKind, Wallet};
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Address, Transaction, Txid};
+use bitcoin::{Transaction, Txid};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,8 +93,9 @@ async fn mcp(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 config: &config,
                 client,
                 calls: 0,
+                chain: config.chain(call.chain),
             };
-            match app.dispatch(call).await {
+            match app.dispatch(call.tool).await {
                 Ok(value) => json_value(200, &mcp::tool_result(&id, value, false)),
                 Err(message) => json_value(
                     200,
@@ -108,11 +111,12 @@ struct App<'a> {
     config: &'a Config,
     client: String,
     calls: u32,
+    chain: Chain,
 }
 
 enum Effect {
     Send {
-        dest: Address,
+        dest: PayTo,
         sats: u64,
         feerate: Option<u64>,
         inputs: InputChoice,
@@ -124,6 +128,7 @@ enum Effect {
     },
     SignTx {
         tx: Transaction,
+        parent_tx_hex: Option<String>,
         broadcast: bool,
         allow_locked: AllowLocked,
     },
@@ -161,11 +166,12 @@ impl App<'_> {
             }
             ToolCall::SignTx {
                 tx_hex,
+                parent_tx_hex,
                 broadcast,
                 allow_locked,
                 request_id,
             } => {
-                self.sign_tx(&tx_hex, broadcast, allow_locked, request_id)
+                self.sign_tx(&tx_hex, parent_tx_hex, broadcast, allow_locked, request_id)
                     .await
             }
             ToolCall::SpendLog { limit } => self.spend_log(limit).await,
@@ -179,12 +185,11 @@ impl App<'_> {
             seed.clear();
             return Err("BTC_WALLET_SEED is missing".into());
         }
-        Wallet::open(
-            seed,
-            self.config.network,
-            self.config.script,
-            self.config.account,
-        )
+        Wallet::open(seed, self.chain, self.config.script, self.config.account)
+    }
+
+    async fn guard(&self, op: &GuardOp) -> Result<GuardReply, String> {
+        guard_call(self.ctx, self.chain.object_name(), op).await
     }
 
     fn descriptor(&self) -> Result<Value, String> {
@@ -192,7 +197,7 @@ impl App<'_> {
         Ok(json!({
             "fingerprint": wallet.fingerprint().to_string(),
             "fingerprint_ok": wallet.fingerprint_ok(self.config.expected_fingerprint).is_ok(),
-            "network": wallet.network().to_string(),
+            "network": self.chain.label(),
             "script": wallet.script().to_string(),
             "account_path": wallet.account_path(),
             "external": wallet.descriptor(ChainKind::External),
@@ -222,8 +227,8 @@ impl App<'_> {
         Ok(json!({
             "confirmed_sats": confirmed,
             "unconfirmed_sats": unconfirmed,
-            "network": self.config.network.to_string(),
-            "script": self.config.script.to_string(),
+            "network": self.chain.label(),
+            "script": wallet.script().to_string(),
             "fingerprint": wallet.fingerprint().to_string(),
             "fingerprint_ok": wallet.fingerprint_ok(self.config.expected_fingerprint).is_ok(),
         }))
@@ -232,39 +237,27 @@ impl App<'_> {
     async fn address(&mut self, advance: bool) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let _ = self.discover(&wallet).await?;
-        let reply = guard_call(
-            self.ctx,
-            &GuardOp::AllocateReceive {
+        let reply = self
+            .guard(&GuardOp::AllocateReceive {
                 advance,
                 max_index: self.config.max_scan_index,
                 gap: self.config.gap_limit,
-            },
-        )
-        .await?;
+            })
+            .await?;
         let index = match reply {
             GuardReply::ReceiveIndex { index } => index,
             GuardReply::Error { message } => return Err(message),
             _ => return Err("spend guard did not allocate an address".into()),
         };
         let derived = wallet.derive(ChainKind::External, index)?;
-        Ok(json!({
-            "address": derived.address.to_string(),
-            "index": index,
-            "chain": "external",
-        }))
+        Ok(mcp::address_result(derived.pay.text(), index))
     }
 
     async fn utxos(&mut self) -> Result<Value, String> {
         let wallet = self.wallet()?;
         let coins = self.collect_utxos(&wallet).await?;
         let book = self.locks().await?;
-        let rows = utxo_rows(
-            &coins,
-            &book,
-            self.config.auto_lock_sats,
-            wallet.script(),
-            wallet.network().bitcoin(),
-        )?;
+        let rows = utxo_rows(&coins, &book, self.config.auto_lock_sats, wallet.script())?;
         Ok(json!({ "utxos": rows }))
     }
 
@@ -291,7 +284,7 @@ impl App<'_> {
             outpoints,
             note,
         };
-        match guard_call(self.ctx, &op).await? {
+        match self.guard(&op).await? {
             GuardReply::LocksSaved => Ok(json!({ "outpoints": rows })),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
@@ -309,7 +302,7 @@ impl App<'_> {
                 1 => ChainKind::Change,
                 _ => return Err("history index chain is invalid".into()),
             };
-            ours.push(wallet.derive(kind, *index)?.address.to_string());
+            ours.push(wallet.derive(kind, *index)?.pay.text().to_string());
         }
         let mut seen = BTreeSet::new();
         let mut rows = Vec::new();
@@ -368,7 +361,7 @@ impl App<'_> {
     }
 
     async fn spend_log(&mut self, limit: u32) -> Result<Value, String> {
-        let reply = guard_call(self.ctx, &GuardOp::SpendLog { limit }).await?;
+        let reply = self.guard(&GuardOp::SpendLog { limit }).await?;
         match reply {
             GuardReply::Log { spends } => Ok(json!({ "spends": spends })),
             GuardReply::Error { message } => Err(message),
@@ -390,14 +383,14 @@ impl App<'_> {
             SendMode::Broadcast { request_id } => request_id,
         };
         wallet.fingerprint_ok(self.config.expected_fingerprint)?;
-        let dest = parse_address(to, self.config.network)?;
+        let dest = self.chain.parse_pay(to)?;
         let listed = match &inputs {
             InputChoice::Auto => None,
             InputChoice::Exactly(set) => Some(set),
         };
         let hash = Canon::send(
             &WalletStamp::of(&wallet),
-            dest.script_pubkey().as_bytes(),
+            dest.script().as_bytes(),
             sats,
             feerate,
             listed,
@@ -419,7 +412,7 @@ impl App<'_> {
         feerate: Option<u64>,
         inputs: &InputChoice,
     ) -> Result<Value, String> {
-        let dest = parse_address(to, self.config.network)?;
+        let dest = self.chain.parse_pay(to)?;
         let book = self.locks().await?;
         let (built, input_sats) = self
             .build_send(wallet, &dest, sats, feerate, inputs, &book)
@@ -464,6 +457,7 @@ impl App<'_> {
     async fn sign_tx(
         &mut self,
         tx_hex: &str,
+        parent_tx_hex: Option<String>,
         broadcast: bool,
         allow_locked: AllowLocked,
         request_id: RequestId,
@@ -474,6 +468,7 @@ impl App<'_> {
         let hash = Canon::sign_tx(&WalletStamp::of(&wallet), &raw, broadcast, allow_locked);
         let effect = Effect::SignTx {
             tx,
+            parent_tx_hex,
             broadcast,
             allow_locked,
         };
@@ -516,9 +511,13 @@ impl App<'_> {
             }
             Effect::SignTx {
                 tx,
+                parent_tx_hex,
                 broadcast,
                 allow_locked,
-            } => self.sign_raw_tx(wallet, tx, broadcast, allow_locked).await,
+            } => {
+                self.sign_raw_tx(wallet, tx, parent_tx_hex, broadcast, allow_locked)
+                    .await
+            }
         };
         let artifact = match signed {
             Ok(artifact) => artifact,
@@ -593,7 +592,7 @@ impl App<'_> {
     async fn build_send(
         &mut self,
         wallet: &Wallet,
-        dest: &Address,
+        dest: &PayTo,
         sats: u64,
         feerate: Option<u64>,
         inputs: &InputChoice,
@@ -610,9 +609,9 @@ impl App<'_> {
             None => self.chosen_feerate().await?,
         };
         let change_index = self.next_change(wallet).await?;
-        let change = wallet.derive(ChainKind::Change, change_index)?.address;
+        let change = wallet.derive(ChainKind::Change, change_index)?.pay;
         let built = build_payment(&Payment {
-            script: self.config.script,
+            script: wallet.script(),
             fingerprint: wallet.fingerprint(),
             coins: &coins,
             dest,
@@ -629,7 +628,7 @@ impl App<'_> {
     async fn sign_send(
         &mut self,
         wallet: &Wallet,
-        dest: &Address,
+        dest: &PayTo,
         sats: u64,
         feerate: Option<u64>,
         inputs: &InputChoice,
@@ -667,7 +666,7 @@ impl App<'_> {
             facts: SpendFacts {
                 kind: SpendKind::Send,
                 input_sats,
-                dest: dest.to_string(),
+                dest: dest.text().to_string(),
                 fee_sats: built.fee_sats,
             },
         })
@@ -690,12 +689,7 @@ impl App<'_> {
             indexes_from_origins(wallet, &psbt),
         )?;
         annotate_owned_inputs(wallet, &mut psbt, &owned)?;
-        let inspection = inspect_psbt(
-            &psbt,
-            &owned,
-            self.config.script,
-            self.config.network.bitcoin(),
-        )?;
+        let inspection = inspect_psbt(&psbt, &owned, wallet.script(), wallet.chain())?;
         let book = self.locks().await?;
         sign_psbt(
             wallet,
@@ -745,12 +739,14 @@ impl App<'_> {
         &mut self,
         wallet: &Wallet,
         tx: Transaction,
+        parent_tx_hex: Option<String>,
         broadcast: bool,
         allow_locked: AllowLocked,
     ) -> Result<Artifact, String> {
+        let plan = classify_parents(&tx, parent_tx_hex.as_deref())?;
         let (cache, _, _) = self.discover(wallet).await?;
         let owned = owned_scripts(wallet, &cache, self.config.max_scan_index, BTreeSet::new())?;
-        let funding = self.funding_txs(&tx).await?;
+        let funding = self.funding_txs(&tx, plan).await?;
         let prevouts = resolve_prevouts(&tx, &funding)?;
         let book = self.locks().await?;
         let signed = sign_raw(
@@ -799,27 +795,27 @@ impl App<'_> {
     async fn funding_txs(
         &mut self,
         tx: &Transaction,
+        plan: ParentPlan,
     ) -> Result<BTreeMap<Txid, Transaction>, String> {
-        let mut funding = BTreeMap::new();
+        let ParentPlan { mut ready, fetch } = plan;
+        let missing: BTreeSet<Txid> = fetch.into_iter().collect();
         for input in &tx.input {
             let txid = input.previous_output.txid;
-            if funding.contains_key(&txid) {
+            if !missing.contains(&txid) || ready.contains_key(&txid) {
                 continue;
             }
+            let vout = input.previous_output.vout;
             let body = self
                 .esplora_get(&format!("/tx/{txid}/hex"))
                 .await
-                .map_err(|err| {
-                    let vout = input.previous_output.vout;
-                    format!("prevout {txid}:{vout} could not be resolved: {err}")
-                })?;
-            funding.insert(txid, parse_funding_tx(&body, txid)?);
+                .map_err(|err| format!("prevout {txid}:{vout} could not be resolved: {err}"))?;
+            ready.insert(txid, parse_funding_tx(&body, txid)?);
         }
-        Ok(funding)
+        Ok(ready)
     }
 
     async fn idempotency(&self, call: Op) -> Result<Decision, String> {
-        match guard_call(self.ctx, &GuardOp::Idempotency { call }).await? {
+        match self.guard(&GuardOp::Idempotency { call }).await? {
             GuardReply::Idempotency { decision } => Ok(decision),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
@@ -850,14 +846,12 @@ impl App<'_> {
         let (change, chg_stats) = self
             .probe(wallet, ChainKind::Change, &cache.used_change, 0)
             .await?;
-        let reply = guard_call(
-            self.ctx,
-            &GuardOp::MergeScan {
+        let reply = self
+            .guard(&GuardOp::MergeScan {
                 used_external: external,
                 used_change: change,
-            },
-        )
-        .await?;
+            })
+            .await?;
         let GuardReply::Scan { cache } = reply else {
             return Err("spend guard did not store the scan".into());
         };
@@ -889,7 +883,7 @@ impl App<'_> {
                 ProbeStep::Probe(index) => {
                     let derived = wallet.derive(chain, index)?;
                     let body = self
-                        .esplora_get(&format!("/address/{}", derived.address))
+                        .esplora_get(&format!("/address/{}", derived.pay.text()))
                         .await?;
                     let parsed = parse_address_stats(&body)?;
                     if parsed.used {
@@ -914,7 +908,7 @@ impl App<'_> {
         }
         let derived = wallet.derive(chain, index)?;
         let body = self
-            .esplora_get(&format!("/address/{}", derived.address))
+            .esplora_get(&format!("/address/{}", derived.pay.text()))
             .await?;
         let parsed = parse_address_stats(&body)?;
         known.insert(index, parsed.clone());
@@ -931,7 +925,7 @@ impl App<'_> {
             for index in indexes {
                 let derived = wallet.derive(chain, index)?;
                 let body = self
-                    .esplora_get(&format!("/address/{}/utxo", derived.address))
+                    .esplora_get(&format!("/address/{}/utxo", derived.pay.text()))
                     .await?;
                 for utxo in parse_utxos(&body)? {
                     coins.push(coin_from(wallet, chain, index, utxo)?);
@@ -958,7 +952,7 @@ impl App<'_> {
     }
 
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {
-        match guard_call(self.ctx, &GuardOp::GetScan).await? {
+        match self.guard(&GuardOp::GetScan).await? {
             GuardReply::Scan { cache } => Ok(cache),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
@@ -966,7 +960,7 @@ impl App<'_> {
     }
 
     async fn locks(&self) -> Result<Lockbook, String> {
-        match guard_call(self.ctx, &GuardOp::GetLocks).await? {
+        match self.guard(&GuardOp::GetLocks).await? {
             GuardReply::Locks { book } => Ok(book),
             GuardReply::Error { message } => Err(message),
             _ => Err("spend guard returned an unexpected payload".into()),
@@ -979,7 +973,8 @@ impl App<'_> {
 
     async fn post_broadcast(&mut self, body: &str) -> BroadcastVerdict {
         let mut attempts = Vec::new();
-        for backend in self.config.backends.clone() {
+        let backends = self.config.backends(self.chain).to_vec();
+        for backend in backends {
             let bearer = if backend.oauth {
                 match self.oauth_token().await {
                     Ok(token) => Some(token),
@@ -1020,7 +1015,7 @@ impl App<'_> {
         content_type: &str,
     ) -> Result<String, String> {
         let mut last = "all esplora backends failed".to_string();
-        let backends = self.config.backends.clone();
+        let backends = self.config.backends(self.chain).to_vec();
         for backend in backends {
             let bearer = if backend.oauth {
                 match self.oauth_token().await {
@@ -1058,7 +1053,7 @@ impl App<'_> {
         if let Ok(GuardReply::Oauth {
             access_token,
             exp_ms,
-        }) = guard_call(self.ctx, &GuardOp::GetOauth).await
+        }) = self.guard(&GuardOp::GetOauth).await
         {
             if exp_ms > now.saturating_add(15_000) && !access_token.is_empty() {
                 return Ok(access_token);
@@ -1092,14 +1087,12 @@ impl App<'_> {
                 .saturating_mul(1000)
                 .saturating_sub(30_000),
         );
-        let _ = guard_call(
-            self.ctx,
-            &GuardOp::PutOauth {
+        let _ = self
+            .guard(&GuardOp::PutOauth {
                 access_token: parsed.access_token.clone(),
                 exp_ms,
-            },
-        )
-        .await;
+            })
+            .await;
         Ok(parsed.access_token)
     }
 
@@ -1156,7 +1149,8 @@ fn coin_from(wallet: &Wallet, chain: ChainKind, index: u32, utxo: Utxo) -> Resul
         txid: crate::tx::parse_txid(&utxo.txid)?,
         vout: utxo.vout,
         value: utxo.value,
-        script_pubkey: derived.address.script_pubkey(),
+        script_pubkey: derived.pay.script().clone(),
+        address: derived.pay.text().to_string(),
         path: derived.path,
         public_key: derived.public_key,
         confirmed: utxo.confirmed,
@@ -1176,6 +1170,7 @@ fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
         auto_lock_sats: var_string(ctx, "AUTO_LOCK_SATS"),
         idempotency_ttl_hours: var_string(ctx, "IDEMPOTENCY_TTL_HOURS"),
         esplora_urls: var_string(ctx, "ESPLORA_URLS"),
+        litecoin_esplora_urls: var_string(ctx, "LITECOIN_ESPLORA_URLS"),
         expected_fingerprint: var_string(ctx, "EXPECTED_FINGERPRINT"),
         access_team_domain: var_string(ctx, "ACCESS_TEAM_DOMAIN"),
         access_aud: var_string(ctx, "ACCESS_AUD"),
@@ -1276,12 +1271,16 @@ fn var_string(ctx: &RouteContext<()>, name: &str) -> String {
         .unwrap_or_default()
 }
 
-async fn guard_call(ctx: &RouteContext<()>, op: &GuardOp) -> Result<GuardReply, String> {
+async fn guard_call(
+    ctx: &RouteContext<()>,
+    object: ObjectName,
+    op: &GuardOp,
+) -> Result<GuardReply, String> {
     let namespace = ctx
         .durable_object("SPEND_GUARD")
         .map_err(|_| "SPEND_GUARD binding is missing")?;
     let stub = namespace
-        .id_from_name("satchel")
+        .id_from_name(object.as_str())
         .map_err(|_| "spend guard id failed")?
         .get_stub()
         .map_err(|_| "spend guard stub failed")?;

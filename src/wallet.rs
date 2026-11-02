@@ -1,4 +1,4 @@
-use crate::chain::{Chain, NetworkKind, PayTo, ScriptKind};
+use crate::chain::{Chain, PayTo, ScriptKind};
 use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
@@ -189,6 +189,7 @@ pub fn xonly_of(public_key: &PublicKey) -> XOnlyPublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::NetworkKind;
 
     fn open(chain: Chain, script: ScriptKind) -> Wallet {
         Wallet::open(BIP84_MNEMONIC.into(), chain, script, 0).unwrap()

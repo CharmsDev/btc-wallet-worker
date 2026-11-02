@@ -1,4 +1,4 @@
-use crate::chain::{Chain, NetworkKind, ScriptKind};
+use crate::chain::{Chain, ScriptKind};
 use crate::guard::{SpendKind, SpendRecord};
 use crate::locks::{AllowLocked, InputSet};
 use crate::wallet::Wallet;
@@ -654,6 +654,7 @@ pub fn client_message(decision: &Decision, request_id: &RequestId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::NetworkKind;
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version;
