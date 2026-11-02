@@ -5,29 +5,21 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Asset for one tool call.
-///
-/// `ChainKind` is the BIP32 receive or change branch. This type is the coin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chain {
     Bitcoin(NetworkKind),
     Litecoin,
 }
 
-/// Parsed `chain` argument. Omitted, blank, and `bitcoin` stay on the worker `NETWORK`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainChoice {
     Configured,
     Litecoin,
 }
 
-/// SpendGuard instance name. Only [`Chain::object_name`] builds one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectName(&'static str);
 
-/// Output script and the address text for that script.
-///
-/// Transaction code reads [`PayTo::script`] and [`PayTo::text`]. The chain codec is the only builder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayTo {
     script: ScriptBuf,
@@ -178,7 +170,6 @@ impl Chain {
         }
     }
 
-    /// BIP84 is P2WPKH. Bitcoin BIP86 is P2TR. Litecoin is always P2WPKH.
     pub fn pay_from_key<C: Verification>(
         self,
         script: ScriptKind,

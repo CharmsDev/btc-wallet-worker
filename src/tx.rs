@@ -677,8 +677,6 @@ pub struct ParentPlan {
     pub fetch: Vec<Txid>,
 }
 
-/// One optional consensus parent. Blank means every input is fetched.
-/// A decoded transaction whose txid is not spent is an error, and that txid is not fetched.
 pub fn classify_parents(
     tx: &Transaction,
     parent_tx_hex: Option<&str>,

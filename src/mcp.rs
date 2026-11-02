@@ -163,7 +163,7 @@ fn initialize_result(id: &Value, params: Option<&Value>) -> Value {
             "protocolVersion": version,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "satchel", "title": "Satchel", "version": "0.1.0" },
-            "instructions": "Satchel is a hot Bitcoin wallet. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt and sign_tx always sign, even when broadcast is false, and the returned transaction can be broadcast elsewhere. Every call that signs needs a request_id. That is send with broadcast true, and every sign_psbt and sign_tx call. Use a new request_id for each new payment. To retry after an error or a lost reply, call again with the same arguments and the same request_id. Satchel then returns the stored result or rebroadcasts the same transaction, and it does not sign a second one. The same request_id with different arguments is an error. Amounts are satoshis. The sum of every input must be within MAX_TX_INPUT_SATS. Coins at or under AUTO_LOCK_SATS start locked, and lock and unlock change that. utxos shows which coins are locked. send without inputs skips locked coins. Listing coins in send inputs allows spending them even when locked. sign_psbt and sign_tx refuse to spend a locked output unless allow_locked is true."
+            "instructions": "Satchel is a hot wallet for Bitcoin and Litecoin. Omit chain, or pass bitcoin, to use the configured Bitcoin network. Pass litecoin for Litecoin mainnet native segwit. send defaults to an unsigned dry run and signs only when broadcast is true. sign_psbt and sign_tx always sign, even when broadcast is false, and the returned transaction can be broadcast elsewhere. Every call that signs needs a request_id. That is send with broadcast true, and every sign_psbt and sign_tx call. Use a new request_id for each new payment. To retry after an error or a lost reply, call again with the same arguments and the same request_id. Satchel then returns the stored result or rebroadcasts the same transaction, and it does not sign a second one. The same request_id with different arguments is an error. Amounts use the sats field. On Bitcoin they are satoshis. On Litecoin they are litoshis. The sum of every input must be within MAX_TX_INPUT_SATS. Coins at or under AUTO_LOCK_SATS start locked, and lock and unlock change that. utxos shows which coins are locked. send without inputs skips locked coins. Listing coins in send inputs allows spending them even when locked. sign_psbt and sign_tx refuse to spend a locked output unless allow_locked is true. sign_tx accepts parent_tx_hex, one consensus-hex parent that is not on the explorer yet. That hex is not part of the retry."
         }),
     )
 }
@@ -536,6 +536,8 @@ mod tests {
                 assert!(instructions.contains("send defaults to an unsigned dry run"));
                 assert!(instructions.contains("sign_psbt and sign_tx always sign"));
                 assert!(instructions.contains("unless allow_locked is true"));
+                assert!(instructions.contains("Pass litecoin for Litecoin mainnet"));
+                assert!(instructions.contains("parent_tx_hex"));
                 assert!(!instructions.contains("sign_psbt default"));
             }
             other => panic!("expected reply, got {other:?}"),
