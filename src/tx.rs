@@ -671,6 +671,49 @@ pub fn parse_raw_tx(tx_hex: &str) -> Result<(Vec<u8>, Transaction), String> {
     Ok((raw, tx))
 }
 
+#[derive(Debug)]
+pub struct ParentPlan {
+    pub ready: BTreeMap<Txid, Transaction>,
+    pub fetch: Vec<Txid>,
+}
+
+/// One optional consensus parent. Blank means every input is fetched.
+/// A decoded transaction whose txid is not spent is an error, and that txid is not fetched.
+pub fn classify_parents(
+    tx: &Transaction,
+    parent_tx_hex: Option<&str>,
+) -> Result<ParentPlan, String> {
+    let mut ready = BTreeMap::new();
+    if let Some(hex) = parent_tx_hex.map(str::trim).filter(|hex| !hex.is_empty()) {
+        if hex.len() > 256_000 {
+            return Err("parent_tx_hex is too large".into());
+        }
+        let raw = hex::decode(hex).map_err(|_| "parent_tx_hex is not hex".to_string())?;
+        let parent: Transaction =
+            deserialize(&raw).map_err(|_| "parent_tx_hex could not be decoded".to_string())?;
+        let txid = parent.compute_txid();
+        let spent = tx
+            .input
+            .iter()
+            .any(|input| input.previous_output.txid == txid);
+        if !spent {
+            return Err(format!(
+                "parent {txid} does not hash to a prevout in this transaction"
+            ));
+        }
+        ready.insert(txid, parent);
+    }
+    let mut fetch = Vec::new();
+    for input in &tx.input {
+        let txid = input.previous_output.txid;
+        if ready.contains_key(&txid) || fetch.contains(&txid) {
+            continue;
+        }
+        fetch.push(txid);
+    }
+    Ok(ParentPlan { ready, fetch })
+}
+
 pub fn resolve_prevouts(
     tx: &Transaction,
     funding: &BTreeMap<Txid, Transaction>,
@@ -1268,6 +1311,89 @@ mod tests {
         assert_eq!(signed.fee_sats, 1_000);
         assert_eq!(signed.dest, FOREIGN);
         assert!(signed.complete);
+    }
+
+    #[test]
+    fn sign_raw_signs_a_litecoin_p2wpkh_input_and_leaves_the_op_return() {
+        let wallet =
+            Wallet::open(BIP84_MNEMONIC.into(), Chain::Litecoin, ScriptKind::Bip86, 0).unwrap();
+        let coin = coin_at(&wallet, 0, 50_000);
+        let op_return = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([0x73, 0x70, 0x65, 0x6c]),
+        };
+        let tx = raw_tx(
+            vec![(coin.outpoint(), Witness::new())],
+            vec![op_return.clone()],
+        );
+        let signed =
+            sign_with(&wallet, &tx, &[prevout_of(&coin)], AllowLocked::No, 100_000).unwrap();
+        let decoded = decode(&signed.tx_hex);
+        verify_p2wpkh_witness(&decoded, 0, coin.value, coin.script_pubkey.as_script()).unwrap();
+        assert_eq!(decoded.output, vec![op_return]);
+        assert_eq!(signed.txid, tx.compute_txid().to_string());
+    }
+
+    #[test]
+    fn supplied_parent_hex_must_hash_to_a_prevout() {
+        let wallet =
+            Wallet::open(BIP84_MNEMONIC.into(), Chain::Litecoin, ScriptKind::Bip84, 0).unwrap();
+        let coin = coin_at(&wallet, 0, 50_000);
+        let parent = raw_tx(
+            vec![(theirs(0), Witness::new())],
+            vec![TxOut {
+                value: Amount::from_sat(coin.value),
+                script_pubkey: coin.script_pubkey.clone(),
+            }],
+        );
+        let parent_hex = serialize_hex(&parent);
+        let spend = raw_tx(
+            vec![(
+                OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                Witness::new(),
+            )],
+            vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([0x73]),
+            }],
+        );
+        let plan = classify_parents(&spend, Some(&parent_hex)).unwrap();
+        assert!(plan.fetch.is_empty());
+        assert_eq!(
+            plan.ready[&parent.compute_txid()].compute_txid(),
+            parent.compute_txid()
+        );
+
+        let other = raw_tx(vec![(theirs(1), Witness::new())], vec![foreign_out(1)]);
+        let err = classify_parents(&spend, Some(&serialize_hex(&other))).unwrap_err();
+        assert!(err.contains("does not hash to a prevout"), "{err}");
+
+        let missing = classify_parents(&spend, None).unwrap();
+        assert_eq!(missing.fetch, vec![parent.compute_txid()]);
+        assert!(missing.ready.is_empty());
+        let blank = classify_parents(&spend, Some("   ")).unwrap();
+        assert_eq!(blank.fetch, missing.fetch);
+
+        let spend_two = raw_tx(
+            vec![
+                (
+                    OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    Witness::new(),
+                ),
+                (theirs(4), Witness::new()),
+            ],
+            vec![],
+        );
+        let mixed = classify_parents(&spend_two, Some(&parent_hex)).unwrap();
+        assert!(mixed.ready.contains_key(&parent.compute_txid()));
+        assert!(!mixed.fetch.contains(&parent.compute_txid()));
+        assert_eq!(mixed.fetch, vec![theirs(4).txid]);
     }
 
     #[test]
