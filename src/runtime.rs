@@ -619,6 +619,7 @@ impl App<'_> {
             feerate,
             change: &change,
             max_input_sats: self.config.max_tx_input_sats,
+            dust_limit: wallet.chain().dust_limit(),
         })?;
         let input_sats = transaction_input_sats(&built.psbt)?;
         enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;

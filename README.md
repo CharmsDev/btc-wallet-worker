@@ -92,7 +92,7 @@ Tools: `balance`, `address`, `history`, `utxos`, `lock`, `unlock`, `fee_estimate
 
 Every tool accepts `chain`. Omit it, send a blank string, or send `bitcoin`, and the call uses `NETWORK` and `SCRIPT`. `litecoin` selects Litecoin mainnet. `ltc` is an error. Amounts stay in `sats`. On Litecoin those integers are litoshis.
 
-`balance` and `descriptor` report `network` as `litecoin` and `script` as `bip84` on a Litecoin call. `address` returns `address`, `index`, and `chain`. That `chain` value is `external`, the receive branch. Litecoin receive and change addresses are `ltc1` witness version 0. `send` accepts that form when the program is 20 bytes. Another prefix, an `ltc1p` address, or a legacy base58 address is rejected.
+`balance` and `descriptor` report `network` as `litecoin` and `script` as `bip84` on a Litecoin call. `address` returns `address`, `index`, and `chain`. That `chain` value is `external`, the receive branch. Litecoin receive and change addresses are `ltc1` witness version 0. `send` accepts that form when the program is 20 bytes. Another prefix, an `ltc1p` address, or a legacy base58 address is rejected. Litecoin `send` refuses an amount below 2940 litoshis, and it adds change only when the change is at least 2940. Bitcoin `send` still uses 546. `sign_tx` does not apply that limit. It leaves the outputs you sent.
 
 `utxos` lists `script_type` as `p2wpkh` on Litecoin.
 

@@ -142,6 +142,17 @@ impl Chain {
         }
     }
 
+    /// Smallest payment or change `send` will create.
+    ///
+    /// Bitcoin stays at 546. Litecoin Core sets `DUST_RELAY_TX_FEE` to 30_000
+    /// litoshi/kvB, and a P2WPKH output is dust below `98 * 30_000 / 1000`.
+    pub fn dust_limit(self) -> u64 {
+        match self {
+            Self::Bitcoin(_) => 546,
+            Self::Litecoin => 2_940,
+        }
+    }
+
     /// Network argument for `Xpriv::new_master`.
     ///
     /// The HMAC key inside rust-bitcoin is `Bitcoin seed` for every network.
@@ -387,5 +398,7 @@ mod tests {
         assert_eq!(Chain::Bitcoin(NetworkKind::Signet).label(), "signet");
         assert_eq!(Chain::Litecoin.master_network(), Network::Bitcoin);
         assert_eq!(Chain::Litecoin.coin_type(), 2);
+        assert_eq!(Chain::Bitcoin(NetworkKind::Mainnet).dust_limit(), 546);
+        assert_eq!(Chain::Litecoin.dust_limit(), 2_940);
     }
 }

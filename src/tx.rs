@@ -21,8 +21,6 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-const DUST_SATS: u64 = 546;
-
 #[derive(Clone, Debug)]
 pub struct Coin {
     pub txid: Txid,
@@ -145,13 +143,14 @@ pub struct Payment<'a> {
     pub feerate: u64,
     pub change: &'a PayTo,
     pub max_input_sats: u64,
+    pub dust_limit: u64,
 }
 
 pub fn build_payment(payment: &Payment<'_>) -> Result<Built, String> {
-    if payment.amount < DUST_SATS {
+    if payment.amount < payment.dust_limit {
         return Err(format!(
-            "amount {} sats is below the dust limit of {DUST_SATS}",
-            payment.amount
+            "amount {} sats is below the dust limit of {}",
+            payment.amount, payment.dust_limit
         ));
     }
     let mut pool: Vec<&Coin> = payment
@@ -227,7 +226,7 @@ fn try_selection(
     let outputs_for_size = if with_change {
         vec![
             tx_out(dest, amount)?,
-            tx_out(change, DUST_SATS.max(amount))?,
+            tx_out(change, payment.dust_limit.max(amount))?,
         ]
     } else {
         vec![tx_out(dest, amount)?]
@@ -243,7 +242,7 @@ fn try_selection(
     }
     let (fee, outputs) = if with_change {
         let change_sats = total - need;
-        if change_sats < DUST_SATS {
+        if change_sats < payment.dust_limit {
             return Ok(None);
         }
         (
@@ -1035,6 +1034,7 @@ mod tests {
             feerate,
             change,
             max_input_sats,
+            dust_limit: wallet.chain().dust_limit(),
         })
     }
 
@@ -1692,6 +1692,55 @@ mod tests {
         assert!(built.feerate_sat_vb >= 201);
         let err = pay(&wallet, std::slice::from_ref(&coin), &dest, &change, 100, 1).unwrap_err();
         assert!(err.contains("dust"));
+        assert!(err.contains("546"));
+    }
+
+    #[test]
+    fn litecoin_send_rejects_below_2940_and_folds_smaller_change_into_the_fee() {
+        let litecoin =
+            Wallet::open(BIP84_MNEMONIC.into(), Chain::Litecoin, ScriptKind::Bip86, 0).unwrap();
+        let coin = coin_at(&litecoin, 0, 5_000);
+        let dest = litecoin.derive(ChainKind::External, 1).unwrap().pay;
+        let change = litecoin.derive(ChainKind::Change, 0).unwrap().pay;
+        let err = pay(
+            &litecoin,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            2_939,
+            1,
+        )
+        .unwrap_err();
+        assert!(err.contains("2940"), "{err}");
+        let built = pay(
+            &litecoin,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            2_940,
+            1,
+        )
+        .unwrap();
+        assert_eq!(built.outputs.len(), 1);
+        assert_eq!(built.outputs[0].sats, 2_940);
+        assert_eq!(built.fee_sats, 5_000 - 2_940);
+        assert!(built.fee_sats > built.vsize);
+        let bitcoin = wallet(ScriptKind::Bip84);
+        let bitcoin_coin = coin_at(&bitcoin, 0, 5_000);
+        let bitcoin_dest = bitcoin.derive(ChainKind::External, 1).unwrap().pay;
+        let bitcoin_change = bitcoin.derive(ChainKind::Change, 0).unwrap().pay;
+        let bitcoin_built = pay(
+            &bitcoin,
+            std::slice::from_ref(&bitcoin_coin),
+            &bitcoin_dest,
+            &bitcoin_change,
+            2_000,
+            1,
+        )
+        .unwrap();
+        assert_eq!(bitcoin_built.outputs.len(), 2);
+        let change_sats = bitcoin_built.outputs[1].sats;
+        assert!((546..2_940).contains(&change_sats), "{change_sats}");
     }
 
     #[test]
