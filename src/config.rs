@@ -1,5 +1,6 @@
+use crate::chain::{NetworkKind, ScriptKind};
 use crate::esplora::{plan_backends, Backend};
-use crate::wallet::{parse_fingerprint, NetworkKind, ScriptKind};
+use crate::wallet::parse_fingerprint;
 use bitcoin::bip32::Fingerprint;
 
 const HOUR_MS: u64 = 3_600_000;

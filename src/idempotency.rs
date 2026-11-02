@@ -1,6 +1,7 @@
+use crate::chain::{Chain, NetworkKind, ScriptKind};
 use crate::guard::{SpendKind, SpendRecord};
 use crate::locks::{AllowLocked, InputSet};
-use crate::wallet::{NetworkKind, ScriptKind, Wallet};
+use crate::wallet::Wallet;
 use bitcoin::hashes::Hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,8 +111,12 @@ pub struct WalletStamp {
 
 impl WalletStamp {
     pub fn of(wallet: &Wallet) -> Self {
+        let network = match wallet.chain() {
+            Chain::Bitcoin(network) => network,
+            Chain::Litecoin => NetworkKind::Mainnet,
+        };
         Self {
-            network: wallet.network(),
+            network,
             script: wallet.script(),
             account: wallet.account(),
             fingerprint: wallet.fingerprint().to_bytes(),
@@ -656,7 +661,6 @@ pub fn client_message(decision: &Decision, request_id: &RequestId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::parse_address;
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version;
@@ -715,9 +719,10 @@ mod tests {
     }
 
     fn script_of(address: &str) -> Vec<u8> {
-        parse_address(address, NetworkKind::Mainnet)
+        Chain::Bitcoin(NetworkKind::Mainnet)
+            .parse_pay(address)
             .unwrap()
-            .script_pubkey()
+            .script()
             .to_bytes()
     }
 

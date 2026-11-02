@@ -1,4 +1,4 @@
-use crate::wallet::NetworkKind;
+use crate::chain::NetworkKind;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{Transaction, Txid};
 use serde::Deserialize;
