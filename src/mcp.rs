@@ -481,7 +481,7 @@ fn tool_specs() -> Vec<Value> {
             "required": ["tx_hex", "request_id"],
             "properties": {
                 "tx_hex": { "type": "string", "description": "Consensus-serialized transaction in hex." },
-                "parent_tx_hex": { "type": "string", "description": "One consensus parent transaction in hex. Omit, null, or blank fetches every parent." },
+                "parent_tx_hex": { "type": ["string", "null"], "description": "One consensus parent transaction in hex. Omit, null, or blank fetches every parent." },
                 "broadcast": { "type": "boolean" },
                 "allow_locked": {
                     "type": "boolean",
@@ -568,11 +568,15 @@ mod tests {
                         "spend_log"
                     ]
                 );
-                assert!(body["result"]["tools"]
-                    .as_array()
-                    .unwrap()
+                let tools = body["result"]["tools"].as_array().unwrap();
+                assert!(tools
                     .iter()
                     .all(|tool| tool["inputSchema"]["properties"]["chain"]["type"] == "string"));
+                let sign_tx = tools.iter().find(|tool| tool["name"] == "sign_tx").unwrap();
+                assert_eq!(
+                    sign_tx["inputSchema"]["properties"]["parent_tx_hex"]["type"],
+                    json!(["string", "null"])
+                );
             }
             other => panic!("expected reply, got {other:?}"),
         }
