@@ -16,16 +16,11 @@ pub fn plan_backends(
     custom_urls: &str,
     have_key: bool,
 ) -> Result<Vec<Backend>, String> {
-    let custom: Vec<&str> = custom_urls
-        .split(',')
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .collect();
+    let custom = split_urls(custom_urls);
     if !custom.is_empty() {
         return Ok(custom
             .into_iter()
-            .map(|url| {
-                let base = url.trim_end_matches('/').to_string();
+            .map(|base| {
                 let oauth = have_key && blockstream_enterprise_origin(&base);
                 Backend { base, oauth }
             })
@@ -59,6 +54,29 @@ pub fn plan_backends(
         }
     }
     Ok(backends)
+}
+
+pub fn plan_litecoin_backends(custom_urls: &str) -> Result<Vec<Backend>, String> {
+    let urls = split_urls(custom_urls);
+    if urls.is_empty() {
+        return Ok(vec![Backend {
+            base: "https://litecoinspace.org/api".into(),
+            oauth: false,
+        }]);
+    }
+    Ok(urls
+        .into_iter()
+        .map(|base| Backend { base, oauth: false })
+        .collect())
+}
+
+fn split_urls(custom_urls: &str) -> Vec<String> {
+    custom_urls
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| url.trim_end_matches('/').to_string())
+        .collect()
 }
 
 fn plain(base: &str) -> Backend {
@@ -599,6 +617,27 @@ mod tests {
         );
         assert!(failover_status(429));
         assert!(!failover_status(400));
+    }
+
+    #[test]
+    fn litecoin_defaults_to_litecoinspace_and_never_sets_oauth() {
+        let defaults = plan_litecoin_backends("").unwrap();
+        assert_eq!(
+            defaults,
+            vec![Backend {
+                base: "https://litecoinspace.org/api".into(),
+                oauth: false,
+            }]
+        );
+        assert_eq!(plan_litecoin_backends(" , ").unwrap(), defaults);
+        let url = "https://enterprise.blockstream.info/api";
+        let bitcoin = plan_backends(NetworkKind::Mainnet, url, true).unwrap();
+        assert!(bitcoin[0].oauth);
+        let litecoin =
+            plan_litecoin_backends(&format!("{url}/, https://litecoinspace.org/api")).unwrap();
+        assert_eq!(litecoin[0].base, url);
+        assert_eq!(litecoin[1].base, "https://litecoinspace.org/api");
+        assert!(litecoin.iter().all(|backend| !backend.oauth));
     }
 
     #[test]
