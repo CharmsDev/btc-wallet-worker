@@ -1,3 +1,4 @@
+use crate::chain::ChainChoice;
 use crate::idempotency::RequestId;
 use crate::locks::{AllowLocked, InputChoice, InputSet, LockAction};
 use serde_json::{json, Value};
@@ -44,6 +45,7 @@ pub enum ToolCall {
     },
     SignTx {
         tx_hex: String,
+        parent_tx_hex: Option<String>,
         broadcast: bool,
         allow_locked: AllowLocked,
         request_id: RequestId,
@@ -54,10 +56,20 @@ pub enum ToolCall {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    pub chain: ChainChoice,
+    pub tool: ToolCall,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Incoming {
     Notification,
     Reply { status: u16, body: Value },
-    Call { id: Value, call: ToolCall },
+    Call { id: Value, call: Call },
+}
+
+pub fn address_result(address: &str, index: u32) -> Value {
+    json!({ "address": address, "index": index, "chain": "external" })
 }
 
 pub fn incoming(body: &str, protocol_header: Option<&str>) -> Incoming {
@@ -156,7 +168,7 @@ fn initialize_result(id: &Value, params: Option<&Value>) -> Value {
     )
 }
 
-fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
+fn parse_call(params: Option<&Value>) -> Result<Call, String> {
     let params = params.ok_or("tools/call needs params")?;
     let name = params
         .get("name")
@@ -169,7 +181,8 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
     if !args.is_object() {
         return Err("tool arguments must be an object".into());
     }
-    match name {
+    let chain = chain_choice(&args)?;
+    let tool = match name {
         "balance" => Ok(ToolCall::Balance),
         "address" => Ok(ToolCall::Address {
             advance: bool_arg(&args, "advance", false)?,
@@ -197,6 +210,7 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
         }),
         "sign_tx" => Ok(ToolCall::SignTx {
             tx_hex: string_arg(&args, "tx_hex")?,
+            parent_tx_hex: parent_tx_hex(&args)?,
             broadcast: bool_arg(&args, "broadcast", false)?,
             allow_locked: allow_locked_arg(&args)?,
             request_id: required_request_id(&args, "request_id is required for sign_tx")?,
@@ -205,6 +219,30 @@ fn parse_call(params: Option<&Value>) -> Result<ToolCall, String> {
             limit: u32_arg(&args, "limit", 50, 1, 200)?,
         }),
         _ => Err(format!("unknown tool {name}")),
+    }?;
+    Ok(Call { chain, tool })
+}
+
+fn chain_choice(args: &Value) -> Result<ChainChoice, String> {
+    match args.get("chain") {
+        None | Some(Value::Null) => ChainChoice::parse(None),
+        Some(Value::String(value)) => ChainChoice::parse(Some(value)),
+        Some(_) => Err("chain must be bitcoin or litecoin".into()),
+    }
+}
+
+fn parent_tx_hex(args: &Value) -> Result<Option<String>, String> {
+    match args.get("parent_tx_hex") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err("parent_tx_hex must be a string".into()),
     }
 }
 
@@ -438,11 +476,12 @@ fn tool_specs() -> Vec<Value> {
                 }
             }
         })),
-        tool("sign_tx", "Sign a consensus-hex transaction. It signs only inputs that spend this wallet's outputs, and leaves every other input and every output, including OP_RETURN, unchanged. It fetches the transaction behind every prevout to learn its value. The input sum must be within MAX_TX_INPUT_SATS. It refuses to spend a locked output unless allow_locked is true. Broadcast only when broadcast is true, and only when every input is signed. request_id is required. To retry, send the same hex, broadcast flag, and allow_locked with the same request_id. Satchel returns the stored transaction and does not sign again.", json!({
+        tool("sign_tx", "Sign a consensus-hex transaction. It signs only inputs that spend this wallet's outputs, and leaves every other input and every output, including OP_RETURN, unchanged. It fetches the transaction behind every prevout to learn its value. parent_tx_hex, one consensus hex string, supplies one of those parents and that txid is not fetched. The input sum must be within MAX_TX_INPUT_SATS. It refuses to spend a locked output unless allow_locked is true. Broadcast only when broadcast is true, and only when every input is signed. request_id is required. To retry, send the same hex, broadcast flag, and allow_locked with the same request_id. parent_tx_hex is not part of that retry. Satchel returns the stored transaction and does not sign again.", json!({
             "type": "object",
             "required": ["tx_hex", "request_id"],
             "properties": {
                 "tx_hex": { "type": "string", "description": "Consensus-serialized transaction in hex." },
+                "parent_tx_hex": { "type": "string", "description": "One consensus parent transaction in hex. Omit, null, or blank fetches every parent." },
                 "broadcast": { "type": "boolean" },
                 "allow_locked": {
                     "type": "boolean",
@@ -461,7 +500,16 @@ fn tool_specs() -> Vec<Value> {
     ]
 }
 
-fn tool(name: &str, description: &str, schema: Value) -> Value {
+fn tool(name: &str, description: &str, mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert(
+            "chain".to_string(),
+            json!({
+                "type": "string",
+                "description": "bitcoin or litecoin. Omit it for the configured Bitcoin network."
+            }),
+        );
+    }
     json!({
         "name": name,
         "description": description,
@@ -518,6 +566,11 @@ mod tests {
                         "spend_log"
                     ]
                 );
+                assert!(body["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|tool| tool["inputSchema"]["properties"]["chain"]["type"] == "string"));
             }
             other => panic!("expected reply, got {other:?}"),
         }
@@ -532,8 +585,9 @@ mod tests {
         match call {
             Incoming::Call { id, call } => {
                 assert_eq!(id, json!("abc"));
+                assert_eq!(call.chain, ChainChoice::Configured);
                 assert_eq!(
-                    call,
+                    call.tool,
                     ToolCall::Send {
                         to: "bc1qtest".into(),
                         sats: 1500,
@@ -614,33 +668,40 @@ mod tests {
             "sign_tx",
             json!({ "tx_hex": " 0200 ", "allow_locked": true, "request_id": "join-4" }),
         ) {
-            Incoming::Call { call, .. } => assert_eq!(
-                call,
-                ToolCall::SignTx {
-                    tx_hex: "0200".into(),
-                    broadcast: false,
-                    allow_locked: AllowLocked::Yes,
-                    request_id: RequestId::parse("join-4").unwrap(),
-                }
-            ),
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::SignTx {
+                        tx_hex: "0200".into(),
+                        parent_tx_hex: None,
+                        broadcast: false,
+                        allow_locked: AllowLocked::Yes,
+                        request_id: RequestId::parse("join-4").unwrap(),
+                    }
+                );
+            }
             other => panic!("expected call, got {other:?}"),
         }
         match call(
             "send",
             json!({ "to": "bc1qtest", "sats": 1500, "broadcast": true, "request_id": " invoice-8841 " }),
         ) {
-            Incoming::Call { call, .. } => assert_eq!(
-                call,
-                ToolCall::Send {
-                    to: "bc1qtest".into(),
-                    sats: 1500,
-                    feerate: None,
-                    inputs: InputChoice::Auto,
-                    mode: SendMode::Broadcast {
-                        request_id: RequestId::parse("invoice-8841").unwrap()
-                    },
-                }
-            ),
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::Send {
+                        to: "bc1qtest".into(),
+                        sats: 1500,
+                        feerate: None,
+                        inputs: InputChoice::Auto,
+                        mode: SendMode::Broadcast {
+                            request_id: RequestId::parse("invoice-8841").unwrap()
+                        },
+                    }
+                );
+            }
             other => panic!("expected call, got {other:?}"),
         }
     }
@@ -651,16 +712,19 @@ mod tests {
             "send",
             json!({ "to": "bc1qtest", "sats": 1500, "request_id": "invoice-8841" }),
         ) {
-            Incoming::Call { call, .. } => assert_eq!(
-                call,
-                ToolCall::Send {
-                    to: "bc1qtest".into(),
-                    sats: 1500,
-                    feerate: None,
-                    inputs: InputChoice::Auto,
-                    mode: SendMode::DryRun,
-                }
-            ),
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::Send {
+                        to: "bc1qtest".into(),
+                        sats: 1500,
+                        feerate: None,
+                        inputs: InputChoice::Auto,
+                        mode: SendMode::DryRun,
+                    }
+                );
+            }
             other => panic!("expected call, got {other:?}"),
         }
         assert_eq!(
@@ -680,18 +744,21 @@ mod tests {
             "send",
             json!({ "to": "bc1qtest", "sats": 1500, "inputs": [first, second] }),
         ) {
-            Incoming::Call { call, .. } => assert_eq!(
-                call,
-                ToolCall::Send {
-                    to: "bc1qtest".into(),
-                    sats: 1500,
-                    feerate: None,
-                    inputs: InputChoice::Exactly(
-                        InputSet::parse("inputs", &[&second, &first]).unwrap()
-                    ),
-                    mode: SendMode::DryRun,
-                }
-            ),
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::Send {
+                        to: "bc1qtest".into(),
+                        sats: 1500,
+                        feerate: None,
+                        inputs: InputChoice::Exactly(
+                            InputSet::parse("inputs", &[&second, &first]).unwrap()
+                        ),
+                        mode: SendMode::DryRun,
+                    }
+                );
+            }
             other => panic!("expected call, got {other:?}"),
         }
         match call(
@@ -699,9 +766,16 @@ mod tests {
             json!({ "to": "bc1qtest", "sats": 1500, "inputs": null }),
         ) {
             Incoming::Call {
-                call: ToolCall::Send { inputs, .. },
+                call:
+                    Call {
+                        chain,
+                        tool: ToolCall::Send { inputs, .. },
+                    },
                 ..
-            } => assert_eq!(inputs, InputChoice::Auto),
+            } => {
+                assert_eq!(chain, ChainChoice::Configured);
+                assert_eq!(inputs, InputChoice::Auto);
+            }
             other => panic!("expected call, got {other:?}"),
         }
         let send_with = |inputs: Value| {
@@ -736,25 +810,31 @@ mod tests {
             "lock",
             json!({ "outpoints": [outpoint], "note": "  inscription  " }),
         ) {
-            Incoming::Call { call, .. } => assert_eq!(
-                call,
-                ToolCall::EditLocks {
-                    action: LockAction::Lock,
-                    outpoints: set.clone(),
-                    note: Some("inscription".into()),
-                }
-            ),
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::EditLocks {
+                        action: LockAction::Lock,
+                        outpoints: set.clone(),
+                        note: Some("inscription".into()),
+                    }
+                );
+            }
             other => panic!("expected call, got {other:?}"),
         }
         match call("unlock", json!({ "outpoints": [outpoint], "note": "   " })) {
-            Incoming::Call { call, .. } => assert_eq!(
-                call,
-                ToolCall::EditLocks {
-                    action: LockAction::Unlock,
-                    outpoints: set,
-                    note: None,
-                }
-            ),
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::EditLocks {
+                        action: LockAction::Unlock,
+                        outpoints: set,
+                        note: None,
+                    }
+                );
+            }
             other => panic!("expected call, got {other:?}"),
         }
         assert_eq!(
@@ -790,15 +870,118 @@ mod tests {
         ] {
             match sign(extra) {
                 Incoming::Call {
-                    call: ToolCall::SignPsbt { allow_locked, .. },
+                    call:
+                        Call {
+                            chain,
+                            tool: ToolCall::SignPsbt { allow_locked, .. },
+                        },
                     ..
-                } => assert_eq!(allow_locked, expected),
+                } => {
+                    assert_eq!(chain, ChainChoice::Configured);
+                    assert_eq!(allow_locked, expected);
+                }
                 other => panic!("expected call, got {other:?}"),
             }
         }
         assert_eq!(
             invalid_params(sign(json!({ "allow_locked": "yes" }))),
             "allow_locked must be a boolean"
+        );
+    }
+
+    #[test]
+    fn omitted_chain_is_bitcoin_and_litecoin_selects_litecoin() {
+        match call("balance", json!({})) {
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Configured);
+                assert_eq!(call.tool, ToolCall::Balance);
+            }
+            other => panic!("expected call, got {other:?}"),
+        }
+        for chain in [json!(null), json!(""), json!("bitcoin"), json!(" Bitcoin ")] {
+            match call("utxos", json!({ "chain": chain })) {
+                Incoming::Call { call, .. } => {
+                    assert_eq!(call.chain, ChainChoice::Configured);
+                    assert_eq!(call.tool, ToolCall::Utxos);
+                }
+                other => panic!("expected call, got {other:?}"),
+            }
+        }
+        match call("address", json!({ "chain": "litecoin", "advance": true })) {
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Litecoin);
+                assert_eq!(call.tool, ToolCall::Address { advance: true });
+            }
+            other => panic!("expected call, got {other:?}"),
+        }
+        assert_eq!(
+            invalid_params(call("balance", json!({ "chain": "ltc" }))),
+            "chain must be bitcoin or litecoin"
+        );
+        let address = address_result("ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh", 3);
+        assert_eq!(
+            address,
+            json!({
+                "address": "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh",
+                "index": 3,
+                "chain": "external"
+            })
+        );
+    }
+
+    #[test]
+    fn parent_tx_hex_is_one_string() {
+        match call(
+            "sign_tx",
+            json!({
+                "chain": "litecoin",
+                "tx_hex": "0200",
+                "request_id": "spell-v16",
+                "parent_tx_hex": "  abcd "
+            }),
+        ) {
+            Incoming::Call { call, .. } => {
+                assert_eq!(call.chain, ChainChoice::Litecoin);
+                assert_eq!(
+                    call.tool,
+                    ToolCall::SignTx {
+                        tx_hex: "0200".into(),
+                        parent_tx_hex: Some("abcd".into()),
+                        broadcast: false,
+                        allow_locked: AllowLocked::No,
+                        request_id: RequestId::parse("spell-v16").unwrap(),
+                    }
+                );
+            }
+            other => panic!("expected call, got {other:?}"),
+        }
+        for arguments in [
+            json!({ "tx_hex": "0200", "request_id": "spell-v16" }),
+            json!({ "tx_hex": "0200", "request_id": "spell-v16", "parent_tx_hex": null }),
+            json!({ "tx_hex": "0200", "request_id": "spell-v16", "parent_tx_hex": "  " }),
+        ] {
+            match call("sign_tx", arguments) {
+                Incoming::Call {
+                    call:
+                        Call {
+                            tool: ToolCall::SignTx { parent_tx_hex, .. },
+                            ..
+                        },
+                    ..
+                } => assert_eq!(parent_tx_hex, None),
+                other => panic!("expected call, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            invalid_params(call(
+                "sign_tx",
+                json!({
+                    "tx_hex": "0200",
+                    "request_id": "spell-v16",
+                    "parent_tx_hex": ["abcd"]
+                })
+            )),
+            "parent_tx_hex must be a string"
         );
     }
 
