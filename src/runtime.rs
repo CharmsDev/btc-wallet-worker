@@ -3,9 +3,9 @@ use crate::chain::{Chain, ObjectName, PayTo};
 use crate::config::{Config, RawConfig};
 use crate::esplora::{
     classify_attempt, fold_broadcast, form_encode, parse_address_stats, parse_api_key,
-    parse_fee_estimates, parse_funding_tx, parse_history_page, parse_litecoin_recommended_fees,
-    parse_token_response, parse_utxos, pick_feerate, AddressStats, AttemptClass, BroadcastVerdict,
-    RawAttempt, Utxo,
+    parse_fee_estimates, parse_funding_tx, parse_history_page, parse_token_response, parse_utxos,
+    pick_feerate, read_fee_body, AddressStats, AttemptClass, BroadcastVerdict, FeeRead, RawAttempt,
+    Utxo,
 };
 use crate::guard::{
     merge_scan, take_receive, GuardOp, GuardReply, OauthCache, SpendKind, SpendLog,
@@ -952,11 +952,41 @@ impl App<'_> {
     }
 
     async fn load_fee_estimates(&mut self) -> Result<BTreeMap<u32, f64>, String> {
-        let body = self.esplora_get(self.chain.fee_estimates_path()).await?;
         match self.chain {
-            Chain::Bitcoin(_) => parse_fee_estimates(&body),
-            Chain::Litecoin => parse_litecoin_recommended_fees(&body),
+            Chain::Bitcoin(_) => {
+                let body = self.esplora_get("/fee-estimates").await?;
+                parse_fee_estimates(&body)
+            }
+            Chain::Litecoin => self.litecoin_fee_estimates().await,
         }
+    }
+
+    async fn litecoin_fee_estimates(&mut self) -> Result<BTreeMap<u32, f64>, String> {
+        let backends = self.config.backends(self.chain).to_vec();
+        let mut last = "all esplora backends failed".to_string();
+        for backend in backends {
+            let base = backend.base.trim_end_matches('/');
+            for path in self.chain.fee_estimate_paths() {
+                let url = format!("{base}{path}");
+                let (status, text) =
+                    match self.http(false, &url, None, "application/json", None).await {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            if err.contains("chain call budget") {
+                                return Err(err);
+                            }
+                            last = err;
+                            break;
+                        }
+                    };
+                match read_fee_body(Chain::Litecoin, path, status, &text) {
+                    Ok(FeeRead::Ready(map)) => return Ok(map),
+                    Ok(FeeRead::Miss { note }) => last = note,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Err(last)
     }
 
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {

@@ -1,4 +1,4 @@
-use crate::chain::NetworkKind;
+use crate::chain::{Chain, NetworkKind};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{Transaction, Txid};
 use serde::Deserialize;
@@ -304,6 +304,30 @@ pub fn parse_litecoin_recommended_fees(body: &str) -> Result<BTreeMap<u32, f64>,
     Ok(out)
 }
 
+pub enum FeeRead {
+    Ready(BTreeMap<u32, f64>),
+    Miss { note: String },
+}
+
+pub fn read_fee_body(chain: Chain, path: &str, status: u16, body: &str) -> Result<FeeRead, String> {
+    if !(200..300).contains(&status) {
+        return Ok(FeeRead::Miss {
+            note: format!("esplora returned {status}"),
+        });
+    }
+    let parsed = match chain {
+        Chain::Litecoin if path == "/v1/fees/recommended" => parse_litecoin_recommended_fees(body),
+        Chain::Litecoin | Chain::Bitcoin(_) => parse_fee_estimates(body),
+    };
+    match parsed {
+        Ok(map) => Ok(FeeRead::Ready(map)),
+        Err(note) if matches!(chain, Chain::Litecoin) && path == "/v1/fees/recommended" => {
+            Ok(FeeRead::Miss { note })
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn insert_recommended(out: &mut BTreeMap<u32, f64>, target: u32, value: Option<&Value>) {
     let Some(rate) = value.and_then(Value::as_f64) else {
         return;
@@ -505,6 +529,7 @@ pub fn fold_broadcast(attempts: &[RawAttempt]) -> BroadcastVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::{Chain, NetworkKind};
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize_hex;
     use bitcoin::transaction::Version;
@@ -643,6 +668,46 @@ mod tests {
         assert!(err.contains("empty"), "{err}");
         let bitcoin = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
         assert_eq!(pick_feerate(&bitcoin, 3).unwrap(), 6);
+    }
+
+    #[test]
+    fn a_missing_recommended_fee_route_uses_the_esplora_table() {
+        let paths = Chain::Litecoin.fee_estimate_paths();
+        let miss = read_fee_body(
+            Chain::Litecoin,
+            paths[0],
+            404,
+            "endpoint does not exist \"/v1/fees/recommended\"",
+        )
+        .unwrap();
+        assert!(matches!(miss, FeeRead::Miss { .. }));
+        let legacy = read_fee_body(Chain::Litecoin, paths[1], 200, r#"{"2":5.1,"6":3.2}"#).unwrap();
+        let FeeRead::Ready(map) = legacy else {
+            panic!("esplora fee table was not used");
+        };
+        assert_eq!(pick_feerate(&map, 3).unwrap(), 6);
+        let recommended = read_fee_body(
+            Chain::Litecoin,
+            paths[0],
+            200,
+            r#"{"fastestFee":9,"halfHourFee":4,"hourFee":2.2,"economyFee":1,"minimumFee":1}"#,
+        )
+        .unwrap();
+        let FeeRead::Ready(map) = recommended else {
+            panic!("recommended fee table was not used");
+        };
+        assert_eq!(pick_feerate(&map, 3).unwrap(), 3);
+        let bitcoin = read_fee_body(
+            Chain::Bitcoin(NetworkKind::Mainnet),
+            "/fee-estimates",
+            200,
+            r#"{"2":5.1,"6":3.2}"#,
+        )
+        .unwrap();
+        let FeeRead::Ready(map) = bitcoin else {
+            panic!("bitcoin fee table was not used");
+        };
+        assert_eq!(pick_feerate(&map, 3).unwrap(), 6);
     }
 
     #[test]

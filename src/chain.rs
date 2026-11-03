@@ -125,10 +125,10 @@ impl ChainChoice {
 }
 
 impl Chain {
-    pub fn fee_estimates_path(self) -> &'static str {
+    pub fn fee_estimate_paths(self) -> &'static [&'static str] {
         match self {
-            Self::Bitcoin(_) => "/fee-estimates",
-            Self::Litecoin => "/v1/fees/recommended",
+            Self::Bitcoin(_) => &["/fee-estimates"],
+            Self::Litecoin => &["/v1/fees/recommended", "/fee-estimates"],
         }
     }
 
@@ -406,10 +406,13 @@ mod tests {
         assert_eq!(Chain::Litecoin.master_network(), Network::Bitcoin);
         assert_eq!(Chain::Litecoin.coin_type(), 2);
         assert_eq!(
-            Chain::Bitcoin(NetworkKind::Mainnet).fee_estimates_path(),
-            "/fee-estimates"
+            Chain::Bitcoin(NetworkKind::Mainnet).fee_estimate_paths(),
+            ["/fee-estimates"]
         );
-        assert_eq!(Chain::Litecoin.fee_estimates_path(), "/v1/fees/recommended");
+        assert_eq!(
+            Chain::Litecoin.fee_estimate_paths(),
+            ["/v1/fees/recommended", "/fee-estimates"]
+        );
         assert_eq!(Chain::Bitcoin(NetworkKind::Mainnet).dust_limit(), 546);
         assert_eq!(Chain::Litecoin.dust_limit(), 2_940);
     }
