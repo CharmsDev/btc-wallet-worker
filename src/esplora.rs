@@ -286,6 +286,10 @@ pub fn parse_history_page(body: &str, ours: &[String]) -> Result<HistoryPage, St
     })
 }
 
+pub fn parse_litecoin_recommended_fees(body: &str) -> Result<BTreeMap<u32, f64>, String> {
+    parse_fee_estimates(body)
+}
+
 pub fn parse_fee_estimates(body: &str) -> Result<BTreeMap<u32, f64>, String> {
     let raw: serde_json::Map<String, Value> =
         serde_json::from_str(body).map_err(|_| "fee estimate response was not esplora json")?;
@@ -593,6 +597,26 @@ mod tests {
         let estimates = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
         assert_eq!(pick_feerate(&estimates, 3).unwrap(), 6);
         assert_eq!(pick_feerate(&estimates, 1).unwrap(), 6);
+    }
+
+    #[test]
+    fn litecoin_recommended_fees_fill_the_next_three_block_targets() {
+        let body = r#"{"fastestFee":9,"halfHourFee":4,"hourFee":2.2,"economyFee":1,"minimumFee":1}"#;
+        let estimates = parse_litecoin_recommended_fees(body).unwrap();
+        assert_eq!(estimates.get(&1).copied(), Some(9.0));
+        assert_eq!(estimates.get(&2).copied(), Some(4.0));
+        assert_eq!(estimates.get(&3).copied(), Some(2.2));
+        assert_eq!(estimates.len(), 3);
+        assert_eq!(pick_feerate(&estimates, 3).unwrap(), 3);
+        assert_eq!(pick_feerate(&estimates, 2).unwrap(), 4);
+        assert_eq!(pick_feerate(&estimates, 1).unwrap(), 9);
+        assert_eq!(pick_feerate(&estimates, 100).unwrap(), 3);
+        let partial = parse_litecoin_recommended_fees(r#"{"fastestFee":7,"economyFee":1}"#).unwrap();
+        assert_eq!(pick_feerate(&partial, 3).unwrap(), 7);
+        let err = parse_litecoin_recommended_fees(r#"{"economyFee":1,"minimumFee":1}"#).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let bitcoin = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
+        assert_eq!(pick_feerate(&bitcoin, 3).unwrap(), 6);
     }
 
     #[test]
