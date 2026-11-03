@@ -286,8 +286,31 @@ pub fn parse_history_page(body: &str, ours: &[String]) -> Result<HistoryPage, St
     })
 }
 
+/// The three named fees are the next three projected blocks.
+/// `economyFee` and `minimumFee` are not confirmation targets.
 pub fn parse_litecoin_recommended_fees(body: &str) -> Result<BTreeMap<u32, f64>, String> {
-    parse_fee_estimates(body)
+    let raw: Value =
+        serde_json::from_str(body).map_err(|_| "fee estimate response was not json".to_string())?;
+    let Some(object) = raw.as_object() else {
+        return Err("fee estimate response was not json".into());
+    };
+    let mut out = BTreeMap::new();
+    insert_recommended(&mut out, 1, object.get("fastestFee"));
+    insert_recommended(&mut out, 2, object.get("halfHourFee"));
+    insert_recommended(&mut out, 3, object.get("hourFee"));
+    if out.is_empty() {
+        return Err("fee estimates were empty".into());
+    }
+    Ok(out)
+}
+
+fn insert_recommended(out: &mut BTreeMap<u32, f64>, target: u32, value: Option<&Value>) {
+    let Some(rate) = value.and_then(Value::as_f64) else {
+        return;
+    };
+    if rate.is_finite() && rate >= 0.0 {
+        out.insert(target, rate);
+    }
 }
 
 pub fn parse_fee_estimates(body: &str) -> Result<BTreeMap<u32, f64>, String> {
@@ -601,7 +624,8 @@ mod tests {
 
     #[test]
     fn litecoin_recommended_fees_fill_the_next_three_block_targets() {
-        let body = r#"{"fastestFee":9,"halfHourFee":4,"hourFee":2.2,"economyFee":1,"minimumFee":1}"#;
+        let body =
+            r#"{"fastestFee":9,"halfHourFee":4,"hourFee":2.2,"economyFee":1,"minimumFee":1}"#;
         let estimates = parse_litecoin_recommended_fees(body).unwrap();
         assert_eq!(estimates.get(&1).copied(), Some(9.0));
         assert_eq!(estimates.get(&2).copied(), Some(4.0));
@@ -611,9 +635,11 @@ mod tests {
         assert_eq!(pick_feerate(&estimates, 2).unwrap(), 4);
         assert_eq!(pick_feerate(&estimates, 1).unwrap(), 9);
         assert_eq!(pick_feerate(&estimates, 100).unwrap(), 3);
-        let partial = parse_litecoin_recommended_fees(r#"{"fastestFee":7,"economyFee":1}"#).unwrap();
+        let partial =
+            parse_litecoin_recommended_fees(r#"{"fastestFee":7,"economyFee":1}"#).unwrap();
         assert_eq!(pick_feerate(&partial, 3).unwrap(), 7);
-        let err = parse_litecoin_recommended_fees(r#"{"economyFee":1,"minimumFee":1}"#).unwrap_err();
+        let err =
+            parse_litecoin_recommended_fees(r#"{"economyFee":1,"minimumFee":1}"#).unwrap_err();
         assert!(err.contains("empty"), "{err}");
         let bitcoin = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
         assert_eq!(pick_feerate(&bitcoin, 3).unwrap(), 6);

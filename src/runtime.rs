@@ -3,8 +3,9 @@ use crate::chain::{Chain, ObjectName, PayTo};
 use crate::config::{Config, RawConfig};
 use crate::esplora::{
     classify_attempt, fold_broadcast, form_encode, parse_address_stats, parse_api_key,
-    parse_fee_estimates, parse_funding_tx, parse_history_page, parse_token_response, parse_utxos,
-    pick_feerate, AddressStats, AttemptClass, BroadcastVerdict, RawAttempt, Utxo,
+    parse_fee_estimates, parse_funding_tx, parse_history_page, parse_litecoin_recommended_fees,
+    parse_token_response, parse_utxos, pick_feerate, AddressStats, AttemptClass, BroadcastVerdict,
+    RawAttempt, Utxo,
 };
 use crate::guard::{
     merge_scan, take_receive, GuardOp, GuardReply, OauthCache, SpendKind, SpendLog,
@@ -350,8 +351,7 @@ impl App<'_> {
     }
 
     async fn fee_estimates(&mut self) -> Result<Value, String> {
-        let body = self.esplora_get("/fee-estimates").await?;
-        let estimates = parse_fee_estimates(&body)?;
+        let estimates = self.load_fee_estimates().await?;
         let chosen = pick_feerate(&estimates, self.config.fee_target_blocks)?;
         Ok(json!({
             "target_blocks": self.config.fee_target_blocks,
@@ -947,9 +947,16 @@ impl App<'_> {
     }
 
     async fn chosen_feerate(&mut self) -> Result<u64, String> {
-        let body = self.esplora_get("/fee-estimates").await?;
-        let estimates = parse_fee_estimates(&body)?;
+        let estimates = self.load_fee_estimates().await?;
         pick_feerate(&estimates, self.config.fee_target_blocks)
+    }
+
+    async fn load_fee_estimates(&mut self) -> Result<BTreeMap<u32, f64>, String> {
+        let body = self.esplora_get(self.chain.fee_estimates_path()).await?;
+        match self.chain {
+            Chain::Bitcoin(_) => parse_fee_estimates(&body),
+            Chain::Litecoin => parse_litecoin_recommended_fees(&body),
+        }
     }
 
     async fn scan_cache(&mut self) -> Result<ScanCache, String> {
