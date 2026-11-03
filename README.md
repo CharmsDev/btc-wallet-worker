@@ -82,7 +82,7 @@ Litecoin calls use `LITECOIN_ESPLORA_URLS`. When that var is empty, the only bac
 
 The key is sent to `https://login.blockstream.com/realms/blockstream-public/protocol/openid-connect/token` with `grant_type=client_credentials` and `scope=openid`. The access token is cached until shortly before `expires_in` and is not logged or returned.
 
-Fee estimates are rounded up to the next whole sat/vB.
+Fee estimates are rounded up to the next whole sat/vB. Bitcoin reads `/fee-estimates`. Litecoin tries `/v1/fees/recommended` and, when that path is missing, `/fee-estimates` on the same host. `fastestFee`, `halfHourFee`, and `hourFee` are the next three projected blocks, so a target of 3 uses `hourFee`. `send` with no `feerate` uses that same estimate.
 
 ## MCP clients
 

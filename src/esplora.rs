@@ -1,4 +1,4 @@
-use crate::chain::NetworkKind;
+use crate::chain::{Chain, NetworkKind};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{Transaction, Txid};
 use serde::Deserialize;
@@ -286,6 +286,57 @@ pub fn parse_history_page(body: &str, ours: &[String]) -> Result<HistoryPage, St
     })
 }
 
+/// The three named fees are the next three projected blocks.
+/// `economyFee` and `minimumFee` are not confirmation targets.
+pub fn parse_litecoin_recommended_fees(body: &str) -> Result<BTreeMap<u32, f64>, String> {
+    let raw: Value =
+        serde_json::from_str(body).map_err(|_| "fee estimate response was not json".to_string())?;
+    let Some(object) = raw.as_object() else {
+        return Err("fee estimate response was not json".into());
+    };
+    let mut out = BTreeMap::new();
+    insert_recommended(&mut out, 1, object.get("fastestFee"));
+    insert_recommended(&mut out, 2, object.get("halfHourFee"));
+    insert_recommended(&mut out, 3, object.get("hourFee"));
+    if out.is_empty() {
+        return Err("fee estimates were empty".into());
+    }
+    Ok(out)
+}
+
+pub enum FeeRead {
+    Ready(BTreeMap<u32, f64>),
+    Miss { note: String },
+}
+
+pub fn read_fee_body(chain: Chain, path: &str, status: u16, body: &str) -> Result<FeeRead, String> {
+    if !(200..300).contains(&status) {
+        return Ok(FeeRead::Miss {
+            note: format!("esplora returned {status}"),
+        });
+    }
+    let parsed = match chain {
+        Chain::Litecoin if path == "/v1/fees/recommended" => parse_litecoin_recommended_fees(body),
+        Chain::Litecoin | Chain::Bitcoin(_) => parse_fee_estimates(body),
+    };
+    match parsed {
+        Ok(map) => Ok(FeeRead::Ready(map)),
+        Err(note) if matches!(chain, Chain::Litecoin) && path == "/v1/fees/recommended" => {
+            Ok(FeeRead::Miss { note })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn insert_recommended(out: &mut BTreeMap<u32, f64>, target: u32, value: Option<&Value>) {
+    let Some(rate) = value.and_then(Value::as_f64) else {
+        return;
+    };
+    if rate.is_finite() && rate >= 0.0 {
+        out.insert(target, rate);
+    }
+}
+
 pub fn parse_fee_estimates(body: &str) -> Result<BTreeMap<u32, f64>, String> {
     let raw: serde_json::Map<String, Value> =
         serde_json::from_str(body).map_err(|_| "fee estimate response was not esplora json")?;
@@ -478,6 +529,7 @@ pub fn fold_broadcast(attempts: &[RawAttempt]) -> BroadcastVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::{Chain, NetworkKind};
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize_hex;
     use bitcoin::transaction::Version;
@@ -593,6 +645,69 @@ mod tests {
         let estimates = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
         assert_eq!(pick_feerate(&estimates, 3).unwrap(), 6);
         assert_eq!(pick_feerate(&estimates, 1).unwrap(), 6);
+    }
+
+    #[test]
+    fn litecoin_recommended_fees_fill_the_next_three_block_targets() {
+        let body =
+            r#"{"fastestFee":9,"halfHourFee":4,"hourFee":2.2,"economyFee":1,"minimumFee":1}"#;
+        let estimates = parse_litecoin_recommended_fees(body).unwrap();
+        assert_eq!(estimates.get(&1).copied(), Some(9.0));
+        assert_eq!(estimates.get(&2).copied(), Some(4.0));
+        assert_eq!(estimates.get(&3).copied(), Some(2.2));
+        assert_eq!(estimates.len(), 3);
+        assert_eq!(pick_feerate(&estimates, 3).unwrap(), 3);
+        assert_eq!(pick_feerate(&estimates, 2).unwrap(), 4);
+        assert_eq!(pick_feerate(&estimates, 1).unwrap(), 9);
+        assert_eq!(pick_feerate(&estimates, 100).unwrap(), 3);
+        let partial =
+            parse_litecoin_recommended_fees(r#"{"fastestFee":7,"economyFee":1}"#).unwrap();
+        assert_eq!(pick_feerate(&partial, 3).unwrap(), 7);
+        let err =
+            parse_litecoin_recommended_fees(r#"{"economyFee":1,"minimumFee":1}"#).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let bitcoin = parse_fee_estimates(r#"{"2":5.1,"6":3.2}"#).unwrap();
+        assert_eq!(pick_feerate(&bitcoin, 3).unwrap(), 6);
+    }
+
+    #[test]
+    fn a_missing_recommended_fee_route_uses_the_esplora_table() {
+        let paths = Chain::Litecoin.fee_estimate_paths();
+        let miss = read_fee_body(
+            Chain::Litecoin,
+            paths[0],
+            404,
+            "endpoint does not exist \"/v1/fees/recommended\"",
+        )
+        .unwrap();
+        assert!(matches!(miss, FeeRead::Miss { .. }));
+        let legacy = read_fee_body(Chain::Litecoin, paths[1], 200, r#"{"2":5.1,"6":3.2}"#).unwrap();
+        let FeeRead::Ready(map) = legacy else {
+            panic!("esplora fee table was not used");
+        };
+        assert_eq!(pick_feerate(&map, 3).unwrap(), 6);
+        let recommended = read_fee_body(
+            Chain::Litecoin,
+            paths[0],
+            200,
+            r#"{"fastestFee":9,"halfHourFee":4,"hourFee":2.2,"economyFee":1,"minimumFee":1}"#,
+        )
+        .unwrap();
+        let FeeRead::Ready(map) = recommended else {
+            panic!("recommended fee table was not used");
+        };
+        assert_eq!(pick_feerate(&map, 3).unwrap(), 3);
+        let bitcoin = read_fee_body(
+            Chain::Bitcoin(NetworkKind::Mainnet),
+            "/fee-estimates",
+            200,
+            r#"{"2":5.1,"6":3.2}"#,
+        )
+        .unwrap();
+        let FeeRead::Ready(map) = bitcoin else {
+            panic!("bitcoin fee table was not used");
+        };
+        assert_eq!(pick_feerate(&map, 3).unwrap(), 6);
     }
 
     #[test]
