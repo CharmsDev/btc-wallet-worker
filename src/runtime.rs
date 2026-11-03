@@ -618,11 +618,11 @@ impl App<'_> {
             amount: sats,
             feerate,
             change: &change,
-            max_input_sats: self.config.max_tx_input_sats,
+            max_input_sats: self.config.max_input_sats(wallet.chain()),
             dust_limit: wallet.chain().dust_limit(),
         })?;
         let input_sats = transaction_input_sats(&built.psbt)?;
-        enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
+        enforce_input_cap(input_sats, self.config.max_input_sats(wallet.chain()))?;
         Ok((built, input_sats))
     }
 
@@ -645,7 +645,7 @@ impl App<'_> {
             &mut psbt,
             &book,
             inputs.allow_locked(),
-            self.config.max_tx_input_sats,
+            self.config.max_input_sats(wallet.chain()),
             self.config.auto_lock_sats,
         )?;
         let (txid, raw_tx_hex) = extract_signed(&psbt)?;
@@ -681,7 +681,7 @@ impl App<'_> {
         allow_locked: AllowLocked,
     ) -> Result<Artifact, String> {
         let input_sats = transaction_input_sats(&psbt)?;
-        enforce_input_cap(input_sats, self.config.max_tx_input_sats)?;
+        enforce_input_cap(input_sats, self.config.max_input_sats(wallet.chain()))?;
         let (cache, _, _) = self.discover(wallet).await?;
         let owned = owned_scripts(
             wallet,
@@ -697,7 +697,7 @@ impl App<'_> {
             &mut psbt,
             &book,
             allow_locked,
-            self.config.max_tx_input_sats,
+            self.config.max_input_sats(wallet.chain()),
             self.config.auto_lock_sats,
         )?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -757,7 +757,7 @@ impl App<'_> {
             &owned,
             &book,
             allow_locked,
-            self.config.max_tx_input_sats,
+            self.config.max_input_sats(wallet.chain()),
             self.config.auto_lock_sats,
         )?;
         if broadcast && !signed.complete {
@@ -1205,6 +1205,7 @@ fn load_config(ctx: &RouteContext<()>) -> Result<Config, String> {
         max_chain_calls: var_string(ctx, "MAX_CHAIN_CALLS"),
         fee_target_blocks: var_string(ctx, "FEE_TARGET_BLOCKS"),
         max_tx_input_sats: var_string(ctx, "MAX_TX_INPUT_SATS"),
+        litecoin_max_tx_input_sats: var_string(ctx, "LITECOIN_MAX_TX_INPUT_SATS"),
         auto_lock_sats: var_string(ctx, "AUTO_LOCK_SATS"),
         idempotency_ttl_hours: var_string(ctx, "IDEMPOTENCY_TTL_HOURS"),
         esplora_urls: var_string(ctx, "ESPLORA_URLS"),
