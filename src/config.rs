@@ -31,6 +31,7 @@ pub struct Config {
     pub max_chain_calls: u32,
     pub fee_target_blocks: u32,
     pub max_tx_input_sats: u64,
+    pub litecoin_max_tx_input_sats: u64,
     pub auto_lock_sats: u64,
     pub idempotency_ttl_ms: u64,
     pub expected_fingerprint: Option<Fingerprint>,
@@ -49,6 +50,7 @@ pub struct RawConfig {
     pub max_chain_calls: String,
     pub fee_target_blocks: String,
     pub max_tx_input_sats: String,
+    pub litecoin_max_tx_input_sats: String,
     pub auto_lock_sats: String,
     pub idempotency_ttl_hours: String,
     pub esplora_urls: String,
@@ -92,6 +94,14 @@ impl Config {
         if max_tx_input_sats == 0 {
             return Err("MAX_TX_INPUT_SATS must be greater than zero".into());
         }
+        let litecoin_max_tx_input_sats = parse_u64(
+            &raw.litecoin_max_tx_input_sats,
+            max_tx_input_sats,
+            "LITECOIN_MAX_TX_INPUT_SATS",
+        )?;
+        if litecoin_max_tx_input_sats == 0 {
+            return Err("LITECOIN_MAX_TX_INPUT_SATS must be greater than zero".into());
+        }
         let auto_lock_sats = parse_u64(&raw.auto_lock_sats, 330, "AUTO_LOCK_SATS")?;
         let idempotency_ttl_hours = bounded(
             parse_u32(&raw.idempotency_ttl_hours, 168, "IDEMPOTENCY_TTL_HOURS")?,
@@ -116,6 +126,7 @@ impl Config {
             max_chain_calls,
             fee_target_blocks,
             max_tx_input_sats,
+            litecoin_max_tx_input_sats,
             auto_lock_sats,
             idempotency_ttl_ms: u64::from(idempotency_ttl_hours) * HOUR_MS,
             expected_fingerprint,
@@ -127,6 +138,14 @@ impl Config {
 
     pub fn chain(&self, choice: ChainChoice) -> Chain {
         choice.resolve(self.network)
+    }
+
+    /// The input cap for one transaction on `chain`.
+    pub fn max_input_sats(&self, chain: Chain) -> u64 {
+        match chain {
+            Chain::Litecoin => self.litecoin_max_tx_input_sats,
+            Chain::Bitcoin(_) => self.max_tx_input_sats,
+        }
     }
 
     pub fn backends(&self, chain: Chain) -> &[Backend] {
@@ -193,6 +212,7 @@ mod tests {
         assert_eq!(config.script, ScriptKind::Bip84);
         assert_eq!(config.gap_limit, 20);
         assert_eq!(config.max_tx_input_sats, 100_000);
+        assert_eq!(config.max_input_sats(Chain::Litecoin), 100_000);
         assert!(config.expected_fingerprint.is_none());
         assert!(config.access.is_none());
         assert_eq!(
@@ -285,5 +305,19 @@ mod tests {
             .backends(Chain::Bitcoin(NetworkKind::Mainnet))
             .iter()
             .any(|backend| backend.oauth));
+    }
+
+    #[test]
+    fn litecoin_cap_is_separate_from_the_bitcoin_cap() {
+        let config = Config::from_raw(&RawConfig {
+            litecoin_max_tx_input_sats: "200000000".into(),
+            ..RawConfig::default()
+        })
+        .unwrap();
+        assert_eq!(config.max_input_sats(Chain::Litecoin), 200_000_000);
+        assert_eq!(
+            config.max_input_sats(Chain::Bitcoin(NetworkKind::Mainnet)),
+            100_000
+        );
     }
 }

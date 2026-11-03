@@ -55,6 +55,7 @@ Vars live in `wrangler.toml`. Secrets are set with `wrangler secret put` and are
 | `MAX_CHAIN_CALLS` | var | `80` | Esplora calls allowed in one tool call |
 | `FEE_TARGET_BLOCKS` | var | `3` | Confirmation target when `feerate` is omitted |
 | `MAX_TX_INPUT_SATS` | var | `100000` | Max sum of all input values in one transaction |
+| `LITECOIN_MAX_TX_INPUT_SATS` | var | `MAX_TX_INPUT_SATS` | Same cap for Litecoin transactions, in litoshis. Unset uses `MAX_TX_INPUT_SATS` |
 | `AUTO_LOCK_SATS` | var | `330` | Wallet coins at or under this value are locked until `unlock`. `0` locks no coin with a positive value. A value that is not a whole number is a config error |
 | `IDEMPOTENCY_TTL_HOURS` | var | `168` | Hours a `request_id` keeps its signed transaction. Must be 24 to 168. A value outside that range is a config error |
 | `ESPLORA_URLS` | var | empty | Comma-separated Bitcoin Esplora bases. Empty uses the defaults below |
