@@ -1,7 +1,8 @@
+use crate::chain::{Chain, PayTo, ScriptKind};
 use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
-use bitcoin::{Address, CompressedPublicKey, Network, XOnlyPublicKey};
+use bitcoin::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -10,87 +11,6 @@ use zeroize::Zeroize;
 #[cfg(test)]
 pub const BIP84_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkKind {
-    Mainnet,
-    Testnet,
-    Signet,
-    Regtest,
-}
-
-impl NetworkKind {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "" | "mainnet" | "bitcoin" => Ok(Self::Mainnet),
-            "testnet" | "testnet3" => Ok(Self::Testnet),
-            "signet" => Ok(Self::Signet),
-            "regtest" => Ok(Self::Regtest),
-            _ => Err("NETWORK must be mainnet, testnet, signet, or regtest".into()),
-        }
-    }
-
-    pub fn bitcoin(self) -> Network {
-        match self {
-            Self::Mainnet => Network::Bitcoin,
-            Self::Testnet => Network::Testnet,
-            Self::Signet => Network::Signet,
-            Self::Regtest => Network::Regtest,
-        }
-    }
-
-    pub fn coin_type(self) -> u32 {
-        match self {
-            Self::Mainnet => 0,
-            Self::Testnet | Self::Signet | Self::Regtest => 1,
-        }
-    }
-}
-
-impl fmt::Display for NetworkKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Mainnet => "mainnet",
-            Self::Testnet => "testnet",
-            Self::Signet => "signet",
-            Self::Regtest => "regtest",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScriptKind {
-    Bip84,
-    Bip86,
-}
-
-impl ScriptKind {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "" | "bip84" | "wpkh" | "segwit" => Ok(Self::Bip84),
-            "bip86" | "tr" | "taproot" => Ok(Self::Bip86),
-            _ => Err("SCRIPT must be bip84 or bip86".into()),
-        }
-    }
-
-    pub fn purpose(self) -> u32 {
-        match self {
-            Self::Bip84 => 84,
-            Self::Bip86 => 86,
-        }
-    }
-}
-
-impl fmt::Display for ScriptKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Bip84 => "bip84",
-            Self::Bip86 => "bip86",
-        })
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,7 +29,7 @@ impl ChainKind {
 }
 
 pub struct Derived {
-    pub address: Address,
+    pub pay: PayTo,
     pub public_key: PublicKey,
     pub path: DerivationPath,
 }
@@ -118,7 +38,7 @@ pub struct Wallet {
     master: Xpriv,
     account_xpub: Xpub,
     fingerprint: Fingerprint,
-    network: NetworkKind,
+    chain: Chain,
     script: ScriptKind,
     account: u32,
     account_path: DerivationPath,
@@ -128,7 +48,7 @@ impl fmt::Debug for Wallet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Wallet")
             .field("fingerprint", &self.fingerprint.to_string())
-            .field("network", &self.network)
+            .field("chain", &self.chain)
             .field("script", &self.script)
             .field("account", &self.account)
             .finish()
@@ -138,24 +58,28 @@ impl fmt::Debug for Wallet {
 impl Wallet {
     pub fn open(
         mut mnemonic_words: String,
-        network: NetworkKind,
+        chain: Chain,
         script: ScriptKind,
         account: u32,
     ) -> Result<Self, String> {
+        let script = match chain {
+            Chain::Litecoin => ScriptKind::Bip84,
+            Chain::Bitcoin(_) => script,
+        };
         let parsed = Mnemonic::parse(mnemonic_words.trim())
             .map_err(|_| "BTC_WALLET_SEED is not a valid BIP39 mnemonic".to_string());
         mnemonic_words.zeroize();
         let mnemonic = parsed?;
         let mut seed = mnemonic.to_seed("");
         let secp = Secp256k1::new();
-        let master = Xpriv::new_master(network.bitcoin(), &seed)
+        let master = Xpriv::new_master(chain.master_network(), &seed)
             .map_err(|_| "BTC_WALLET_SEED could not derive a master key".to_string());
         seed.zeroize();
         let master = master?;
         let account_path = DerivationPath::from_str(&format!(
             "m/{}'/{}'/{}'",
             script.purpose(),
-            network.coin_type(),
+            chain.coin_type(),
             account
         ))
         .map_err(|_| "account path is invalid".to_string())?;
@@ -168,7 +92,7 @@ impl Wallet {
             master,
             account_xpub,
             fingerprint,
-            network,
+            chain,
             script,
             account,
             account_path,
@@ -179,8 +103,8 @@ impl Wallet {
         self.fingerprint
     }
 
-    pub fn network(&self) -> NetworkKind {
-        self.network
+    pub fn chain(&self) -> Chain {
+        self.chain
     }
 
     pub fn script(&self) -> ScriptKind {
@@ -211,7 +135,7 @@ impl Wallet {
             "[{}/{}'/{}'/{}']",
             self.fingerprint,
             self.script.purpose(),
-            self.network.coin_type(),
+            self.chain.coin_type(),
             self.account
         );
         let xpub = self.account_xpub.to_string();
@@ -225,7 +149,7 @@ impl Wallet {
         let path = DerivationPath::from_str(&format!(
             "m/{}'/{}'/{}'/{}/{}",
             self.script.purpose(),
-            self.network.coin_type(),
+            self.chain.coin_type(),
             self.account,
             chain.index(),
             index
@@ -237,19 +161,9 @@ impl Wallet {
             .derive_priv(&secp, &path)
             .map_err(|_| "derivation path could not be derived".to_string())?;
         let public_key = PublicKey::from_secret_key(&secp, &child.private_key);
-        let address = match self.script {
-            ScriptKind::Bip84 => {
-                let compressed = CompressedPublicKey::from_slice(&public_key.serialize())
-                    .map_err(|_| "public key is not compressed".to_string())?;
-                Address::p2wpkh(&compressed, self.network.bitcoin())
-            }
-            ScriptKind::Bip86 => {
-                let (xonly, _) = public_key.x_only_public_key();
-                Address::p2tr(&secp, xonly, None, self.network.bitcoin())
-            }
-        };
+        let pay = self.chain.pay_from_key(self.script, &public_key, &secp)?;
         Ok(Derived {
-            address,
+            pay,
             public_key,
             path,
         })
@@ -268,13 +182,6 @@ pub fn parse_fingerprint(value: &str) -> Result<Fingerprint, String> {
     Fingerprint::from_str(value).map_err(|_| "EXPECTED_FINGERPRINT must be 8 hex characters".into())
 }
 
-pub fn parse_address(value: &str, network: NetworkKind) -> Result<Address, String> {
-    let unchecked = Address::from_str(value.trim()).map_err(|_| "invalid address".to_string())?;
-    unchecked
-        .require_network(network.bitcoin())
-        .map_err(|_| format!("address is not valid for {network}"))
-}
-
 pub fn xonly_of(public_key: &PublicKey) -> XOnlyPublicKey {
     public_key.x_only_public_key().0
 }
@@ -282,31 +189,31 @@ pub fn xonly_of(public_key: &PublicKey) -> XOnlyPublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::NetworkKind;
+
+    fn open(chain: Chain, script: ScriptKind) -> Wallet {
+        Wallet::open(BIP84_MNEMONIC.into(), chain, script, 0).unwrap()
+    }
 
     #[test]
     fn bip84_vector_matches_the_published_addresses() {
-        let wallet = Wallet::open(
-            BIP84_MNEMONIC.into(),
-            NetworkKind::Mainnet,
-            ScriptKind::Bip84,
-            0,
-        )
-        .unwrap();
+        let wallet = open(Chain::Bitcoin(NetworkKind::Mainnet), ScriptKind::Bip84);
         let first = wallet.derive(ChainKind::External, 0).unwrap();
         let second = wallet.derive(ChainKind::External, 1).unwrap();
         let change = wallet.derive(ChainKind::Change, 0).unwrap();
         assert_eq!(
-            first.address.to_string(),
+            first.pay.text(),
             "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
         );
         assert_eq!(
-            second.address.to_string(),
+            second.pay.text(),
             "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g"
         );
         assert_eq!(
-            change.address.to_string(),
+            change.pay.text(),
             "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el"
         );
+        assert_eq!(wallet.fingerprint().to_string(), "73c5da0a");
         assert_eq!(
             hex::encode(first.public_key.serialize()),
             "0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c"
@@ -319,73 +226,96 @@ mod tests {
 
     #[test]
     fn bip86_vector_matches_the_first_receive_address() {
-        let wallet = Wallet::open(
-            BIP84_MNEMONIC.into(),
-            NetworkKind::Mainnet,
-            ScriptKind::Bip86,
-            0,
-        )
-        .unwrap();
+        let wallet = open(Chain::Bitcoin(NetworkKind::Mainnet), ScriptKind::Bip86);
         let first = wallet.derive(ChainKind::External, 0).unwrap();
         assert_eq!(
-            first.address.to_string(),
+            first.pay.text(),
             "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
         );
+        assert_eq!(wallet.fingerprint().to_string(), "73c5da0a");
         assert!(wallet.descriptor(ChainKind::Change).starts_with("tr("));
         assert_eq!(wallet.account_path(), "m/86'/0'/0'");
     }
 
     #[test]
+    fn litecoin_bip84_matches_the_published_receive_and_keeps_the_fingerprint() {
+        let bitcoin = open(Chain::Bitcoin(NetworkKind::Mainnet), ScriptKind::Bip84);
+        let litecoin = open(Chain::Litecoin, ScriptKind::Bip86);
+        assert_eq!(litecoin.script(), ScriptKind::Bip84);
+        assert_eq!(litecoin.fingerprint(), bitcoin.fingerprint());
+        assert_eq!(litecoin.fingerprint().to_string(), "73c5da0a");
+        assert_eq!(litecoin.account_path(), "m/84'/2'/0'");
+        let receive = litecoin.derive(ChainKind::External, 0).unwrap();
+        assert_eq!(format!("m/{}", receive.path), "m/84'/2'/0'/0/0");
+        assert_eq!(
+            receive.pay.text(),
+            "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh"
+        );
+        assert_eq!(
+            hex::encode(receive.public_key.serialize()),
+            "02e49c9b9b5d0f127235dc26a0c252814c52fb333d651a946773f59d72c2da9904"
+        );
+        let change = litecoin.derive(ChainKind::Change, 0).unwrap();
+        assert_eq!(
+            change.pay.text(),
+            "ltc1qyeljcy9v88jg8sqvnqh0m5q390xruc5r98q9yy"
+        );
+        assert_eq!(format!("m/{}", change.path), "m/84'/2'/0'/1/0");
+        let descriptor = litecoin.descriptor(ChainKind::External);
+        assert!(descriptor.starts_with("wpkh("));
+        assert!(descriptor.contains("xpub"));
+        assert!(!descriptor.contains("zpub"));
+    }
+
+    #[test]
     fn testnet_uses_coin_type_one_and_rejects_mainnet_addresses() {
-        let wallet = Wallet::open(
-            BIP84_MNEMONIC.into(),
-            NetworkKind::Testnet,
-            ScriptKind::Bip84,
-            0,
-        )
-        .unwrap();
+        let wallet = open(Chain::Bitcoin(NetworkKind::Testnet), ScriptKind::Bip84);
         let address = wallet
             .derive(ChainKind::External, 0)
             .unwrap()
-            .address
+            .pay
+            .text()
             .to_string();
         assert!(address.starts_with("tb1q"), "{address}");
         assert_eq!(wallet.account_path(), "m/84'/1'/0'");
-        assert!(parse_address(
-            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
-            NetworkKind::Testnet
-        )
-        .is_err());
-        assert!(parse_address(&address, NetworkKind::Testnet).is_ok());
-        assert!(parse_address(&address, NetworkKind::Mainnet).is_err());
-        let signet = parse_address(&address, NetworkKind::Signet);
-        assert!(signet.is_ok());
+        assert_eq!(wallet.fingerprint().to_string(), "73c5da0a");
+        assert!(Chain::Bitcoin(NetworkKind::Testnet)
+            .parse_pay("bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
+            .is_err());
+        assert!(Chain::Bitcoin(NetworkKind::Testnet)
+            .parse_pay(&address)
+            .is_ok());
+        assert!(Chain::Bitcoin(NetworkKind::Mainnet)
+            .parse_pay(&address)
+            .is_err());
+        assert!(Chain::Bitcoin(NetworkKind::Signet)
+            .parse_pay(&address)
+            .is_ok());
     }
 
     #[test]
     fn regtest_addresses_stay_on_regtest() {
-        let wallet = Wallet::open(
-            BIP84_MNEMONIC.into(),
-            NetworkKind::Regtest,
-            ScriptKind::Bip84,
-            0,
-        )
-        .unwrap();
+        let wallet = open(Chain::Bitcoin(NetworkKind::Regtest), ScriptKind::Bip84);
         let address = wallet
             .derive(ChainKind::External, 0)
             .unwrap()
-            .address
+            .pay
+            .text()
             .to_string();
         assert!(address.starts_with("bcrt1q"), "{address}");
-        assert!(parse_address(&address, NetworkKind::Regtest).is_ok());
-        assert!(parse_address(&address, NetworkKind::Signet).is_err());
+        assert!(Chain::Bitcoin(NetworkKind::Regtest)
+            .parse_pay(&address)
+            .is_ok());
+        assert!(Chain::Bitcoin(NetworkKind::Signet)
+            .parse_pay(&address)
+            .is_err());
     }
 
     #[test]
     fn a_bad_mnemonic_does_not_echo_the_input() {
         let err = Wallet::open(
             "zzzz not-a-seed".into(),
-            NetworkKind::Mainnet,
+            Chain::Bitcoin(NetworkKind::Mainnet),
             ScriptKind::Bip84,
             0,
         )
@@ -396,13 +326,7 @@ mod tests {
 
     #[test]
     fn expected_fingerprint_gates_signing() {
-        let wallet = Wallet::open(
-            BIP84_MNEMONIC.into(),
-            NetworkKind::Mainnet,
-            ScriptKind::Bip84,
-            0,
-        )
-        .unwrap();
+        let wallet = open(Chain::Bitcoin(NetworkKind::Mainnet), ScriptKind::Bip84);
         assert!(wallet.fingerprint_ok(None).is_ok());
         assert!(wallet.fingerprint_ok(Some(wallet.fingerprint())).is_ok());
         let other = parse_fingerprint("00000000").unwrap();

@@ -1,7 +1,8 @@
+use crate::chain::{Chain, PayTo, ScriptKind};
 use crate::locks::{refuse_locked, AllowLocked, InputChoice, Lockbook, Scope};
 use crate::policy::enforce_input_cap;
 use crate::scan::ScanCache;
-use crate::wallet::{xonly_of, ChainKind, ScriptKind, Wallet};
+use crate::wallet::{xonly_of, ChainKind, Wallet};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bitcoin::absolute::LockTime;
@@ -14,14 +15,11 @@ use bitcoin::secp256k1::{Message, PublicKey, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::transaction::Version;
 use bitcoin::{
-    ecdsa, taproot, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxOut, Txid, Witness,
+    ecdsa, taproot, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
-
-const DUST_SATS: u64 = 546;
 
 #[derive(Clone, Debug)]
 pub struct Coin {
@@ -29,6 +27,7 @@ pub struct Coin {
     pub vout: u32,
     pub value: u64,
     pub script_pubkey: ScriptBuf,
+    pub address: String,
     pub path: DerivationPath,
     pub public_key: PublicKey,
     pub confirmed: bool,
@@ -87,7 +86,6 @@ pub fn utxo_rows(
     book: &Lockbook,
     auto_lock_sats: u64,
     script: ScriptKind,
-    network: Network,
 ) -> Result<Vec<Value>, String> {
     let script_type = match script {
         ScriptKind::Bip84 => "p2wpkh",
@@ -96,8 +94,6 @@ pub fn utxo_rows(
     coins
         .iter()
         .map(|coin| {
-            let address = Address::from_script(&coin.script_pubkey, network)
-                .map_err(|_| "utxo script has no address".to_string())?;
             let [.., chain, index] = coin.path.as_ref() else {
                 return Err("utxo path is too short".into());
             };
@@ -107,7 +103,7 @@ pub fn utxo_rows(
                 "vout": coin.vout,
                 "value_sats": coin.value,
                 "confirmed": coin.confirmed,
-                "address": address.to_string(),
+                "address": coin.address,
                 "script_pubkey": hex::encode(coin.script_pubkey.as_bytes()),
                 "script_type": script_type,
                 "path": format!("{chain}/{index}"),
@@ -142,18 +138,19 @@ pub struct Payment<'a> {
     pub script: ScriptKind,
     pub fingerprint: Fingerprint,
     pub coins: &'a [Coin],
-    pub dest: &'a Address,
+    pub dest: &'a PayTo,
     pub amount: u64,
     pub feerate: u64,
-    pub change: &'a Address,
+    pub change: &'a PayTo,
     pub max_input_sats: u64,
+    pub dust_limit: u64,
 }
 
 pub fn build_payment(payment: &Payment<'_>) -> Result<Built, String> {
-    if payment.amount < DUST_SATS {
+    if payment.amount < payment.dust_limit {
         return Err(format!(
-            "amount {} sats is below the dust limit of {DUST_SATS}",
-            payment.amount
+            "amount {} sats is below the dust limit of {}",
+            payment.amount, payment.dust_limit
         ));
     }
     let mut pool: Vec<&Coin> = payment
@@ -229,7 +226,7 @@ fn try_selection(
     let outputs_for_size = if with_change {
         vec![
             tx_out(dest, amount)?,
-            tx_out(change, DUST_SATS.max(amount))?,
+            tx_out(change, payment.dust_limit.max(amount))?,
         ]
     } else {
         vec![tx_out(dest, amount)?]
@@ -245,19 +242,19 @@ fn try_selection(
     }
     let (fee, outputs) = if with_change {
         let change_sats = total - need;
-        if change_sats < DUST_SATS {
+        if change_sats < payment.dust_limit {
             return Ok(None);
         }
         (
             fee,
             vec![
                 BuiltOutput {
-                    address: dest.to_string(),
+                    address: dest.text().to_string(),
                     sats: amount,
                     change: false,
                 },
                 BuiltOutput {
-                    address: change.to_string(),
+                    address: change.text().to_string(),
                     sats: change_sats,
                     change: true,
                 },
@@ -268,7 +265,7 @@ fn try_selection(
         (
             fee,
             vec![BuiltOutput {
-                address: dest.to_string(),
+                address: dest.text().to_string(),
                 sats: amount,
                 change: false,
             }],
@@ -298,10 +295,10 @@ fn try_selection(
     }))
 }
 
-fn tx_out(address: &Address, sats: u64) -> Result<TxOut, String> {
+fn tx_out(pay: &PayTo, sats: u64) -> Result<TxOut, String> {
     Ok(TxOut {
         value: Amount::from_sat(sats),
-        script_pubkey: address.script_pubkey(),
+        script_pubkey: pay.script().clone(),
     })
 }
 
@@ -401,7 +398,7 @@ pub fn inspect_psbt(
     psbt: &Psbt,
     owned: &BTreeMap<ScriptBuf, (ChainKind, u32)>,
     script: ScriptKind,
-    network: Network,
+    chain: Chain,
 ) -> Result<Inspection, String> {
     let mut our_in = 0u64;
     let mut all_in = 0u64;
@@ -448,7 +445,7 @@ pub fn inspect_psbt(
         fee_sats,
         vsize,
         outflow_sats,
-        dest: external_dest(&psbt.unsigned_tx, owned, network),
+        dest: external_dest(&psbt.unsigned_tx, owned, chain),
         our_inputs,
         broadcastable_after_sign: broadcastable,
     })
@@ -471,17 +468,14 @@ fn input_utxo(input: &bitcoin::psbt::Input, txin: &TxIn) -> Result<TxOut, String
 fn external_dest(
     tx: &Transaction,
     owned: &BTreeMap<ScriptBuf, (ChainKind, u32)>,
-    network: Network,
+    chain: Chain,
 ) -> String {
     let mut labels = Vec::new();
     for output in &tx.output {
         if owned.contains_key(&output.script_pubkey) {
             continue;
         }
-        let label = Address::from_script(&output.script_pubkey, network)
-            .map(|address| address.to_string())
-            .unwrap_or_else(|_| hex::encode(output.script_pubkey.as_bytes()));
-        labels.push(label);
+        labels.push(chain.label_script(&output.script_pubkey));
         if labels.len() == 3 {
             break;
         }
@@ -676,6 +670,47 @@ pub fn parse_raw_tx(tx_hex: &str) -> Result<(Vec<u8>, Transaction), String> {
     Ok((raw, tx))
 }
 
+#[derive(Debug)]
+pub struct ParentPlan {
+    pub ready: BTreeMap<Txid, Transaction>,
+    pub fetch: Vec<Txid>,
+}
+
+pub fn classify_parents(
+    tx: &Transaction,
+    parent_tx_hex: Option<&str>,
+) -> Result<ParentPlan, String> {
+    let mut ready = BTreeMap::new();
+    if let Some(hex) = parent_tx_hex.map(str::trim).filter(|hex| !hex.is_empty()) {
+        if hex.len() > 256_000 {
+            return Err("parent_tx_hex is too large".into());
+        }
+        let raw = hex::decode(hex).map_err(|_| "parent_tx_hex is not hex".to_string())?;
+        let parent: Transaction =
+            deserialize(&raw).map_err(|_| "parent_tx_hex could not be decoded".to_string())?;
+        let txid = parent.compute_txid();
+        let spent = tx
+            .input
+            .iter()
+            .any(|input| input.previous_output.txid == txid);
+        if !spent {
+            return Err(format!(
+                "parent {txid} does not hash to a prevout in this transaction"
+            ));
+        }
+        ready.insert(txid, parent);
+    }
+    let mut fetch = Vec::new();
+    for input in &tx.input {
+        let txid = input.previous_output.txid;
+        if ready.contains_key(&txid) || fetch.contains(&txid) {
+            continue;
+        }
+        fetch.push(txid);
+    }
+    Ok(ParentPlan { ready, fetch })
+}
+
 pub fn resolve_prevouts(
     tx: &Transaction,
     funding: &BTreeMap<Txid, Transaction>,
@@ -808,7 +843,7 @@ pub fn sign_raw(
         tx_hex: serialize_hex(&signed),
         input_sats,
         fee_sats,
-        dest: external_dest(&signed, owned, wallet.network().bitcoin()),
+        dest: external_dest(&signed, owned, wallet.chain()),
         complete: signed
             .input
             .iter()
@@ -876,7 +911,7 @@ pub fn owned_scripts(
         .into_iter()
         .map(|(chain, index)| {
             let derived = wallet.derive(chain, index)?;
-            Ok((derived.address.script_pubkey(), (chain, index)))
+            Ok((derived.pay.script().clone(), (chain, index)))
         })
         .collect()
 }
@@ -916,7 +951,7 @@ fn path_index(wallet: &Wallet, path: &DerivationPath) -> Option<(ChainKind, u32)
     let purpose = hardened(&parts[0])?;
     let coin = hardened(&parts[1])?;
     let account = hardened(&parts[2])?;
-    if purpose != wallet.script().purpose() || coin != wallet.network().coin_type() {
+    if purpose != wallet.script().purpose() || coin != wallet.chain().coin_type() {
         return None;
     }
     if account != wallet.account() {
@@ -947,21 +982,34 @@ fn normal(child: &ChildNumber) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::NetworkKind;
     use crate::locks::{InputSet, LockAction};
-    use crate::wallet::{ChainKind, NetworkKind, ScriptKind, Wallet, BIP84_MNEMONIC};
+    use crate::wallet::{ChainKind, Wallet, BIP84_MNEMONIC};
     use bitcoin::XOnlyPublicKey;
 
     const FOREIGN: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 
     fn wallet(script: ScriptKind) -> Wallet {
-        Wallet::open(BIP84_MNEMONIC.into(), NetworkKind::Mainnet, script, 0).unwrap()
+        Wallet::open(
+            BIP84_MNEMONIC.into(),
+            Chain::Bitcoin(NetworkKind::Mainnet),
+            script,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn foreign() -> PayTo {
+        Chain::Bitcoin(NetworkKind::Mainnet)
+            .parse_pay(FOREIGN)
+            .unwrap()
     }
 
     fn pay<'a>(
         wallet: &'a Wallet,
         coins: &'a [Coin],
-        dest: &'a Address,
-        change: &'a Address,
+        dest: &'a PayTo,
+        change: &'a PayTo,
         amount: u64,
         feerate: u64,
     ) -> Result<Built, String> {
@@ -971,8 +1019,8 @@ mod tests {
     fn pay_capped<'a>(
         wallet: &'a Wallet,
         coins: &'a [Coin],
-        dest: &'a Address,
-        change: &'a Address,
+        dest: &'a PayTo,
+        change: &'a PayTo,
         amount: u64,
         feerate: u64,
         max_input_sats: u64,
@@ -986,6 +1034,7 @@ mod tests {
             feerate,
             change,
             max_input_sats,
+            dust_limit: wallet.chain().dust_limit(),
         })
     }
 
@@ -995,7 +1044,8 @@ mod tests {
             txid: Txid::from_str(&format!("{:064x}", index + 1)).unwrap(),
             vout: 0,
             value,
-            script_pubkey: derived.address.script_pubkey(),
+            script_pubkey: derived.pay.script().clone(),
+            address: derived.pay.text().to_string(),
             path: derived.path,
             public_key: derived.public_key,
             confirmed: true,
@@ -1031,11 +1081,7 @@ mod tests {
     fn foreign_out(sats: u64) -> TxOut {
         TxOut {
             value: Amount::from_sat(sats),
-            script_pubkey: Address::from_str(FOREIGN)
-                .unwrap()
-                .require_network(Network::Bitcoin)
-                .unwrap()
-                .script_pubkey(),
+            script_pubkey: foreign().script().clone(),
         }
     }
 
@@ -1125,8 +1171,8 @@ mod tests {
 
         let pool = coins_for_send(every.clone(), &listed(&[&fuel, &charm]), &book, 330).unwrap();
         assert_eq!(outpoints_of(&pool), vec![charm.outpoint(), fuel.outpoint()]);
-        let dest = wallet.derive(ChainKind::External, 5).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 5).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let built = pay(&wallet, &pool, &dest, &change, 20_000, 2).unwrap();
         let spent: Vec<OutPoint> = built
             .psbt
@@ -1148,8 +1194,8 @@ mod tests {
     fn sign_psbt_refuses_a_locked_input_unless_allowed() {
         let wallet = wallet(ScriptKind::Bip84);
         let coin = coin_at(&wallet, 0, 50_000);
-        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let mut psbt = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1263,6 +1309,89 @@ mod tests {
         assert_eq!(signed.fee_sats, 1_000);
         assert_eq!(signed.dest, FOREIGN);
         assert!(signed.complete);
+    }
+
+    #[test]
+    fn sign_raw_signs_a_litecoin_p2wpkh_input_and_leaves_the_op_return() {
+        let wallet =
+            Wallet::open(BIP84_MNEMONIC.into(), Chain::Litecoin, ScriptKind::Bip86, 0).unwrap();
+        let coin = coin_at(&wallet, 0, 50_000);
+        let op_return = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([0x73, 0x70, 0x65, 0x6c]),
+        };
+        let tx = raw_tx(
+            vec![(coin.outpoint(), Witness::new())],
+            vec![op_return.clone()],
+        );
+        let signed =
+            sign_with(&wallet, &tx, &[prevout_of(&coin)], AllowLocked::No, 100_000).unwrap();
+        let decoded = decode(&signed.tx_hex);
+        verify_p2wpkh_witness(&decoded, 0, coin.value, coin.script_pubkey.as_script()).unwrap();
+        assert_eq!(decoded.output, vec![op_return]);
+        assert_eq!(signed.txid, tx.compute_txid().to_string());
+    }
+
+    #[test]
+    fn supplied_parent_hex_must_hash_to_a_prevout() {
+        let wallet =
+            Wallet::open(BIP84_MNEMONIC.into(), Chain::Litecoin, ScriptKind::Bip84, 0).unwrap();
+        let coin = coin_at(&wallet, 0, 50_000);
+        let parent = raw_tx(
+            vec![(theirs(0), Witness::new())],
+            vec![TxOut {
+                value: Amount::from_sat(coin.value),
+                script_pubkey: coin.script_pubkey.clone(),
+            }],
+        );
+        let parent_hex = serialize_hex(&parent);
+        let spend = raw_tx(
+            vec![(
+                OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                Witness::new(),
+            )],
+            vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([0x73]),
+            }],
+        );
+        let plan = classify_parents(&spend, Some(&parent_hex)).unwrap();
+        assert!(plan.fetch.is_empty());
+        assert_eq!(
+            plan.ready[&parent.compute_txid()].compute_txid(),
+            parent.compute_txid()
+        );
+
+        let other = raw_tx(vec![(theirs(1), Witness::new())], vec![foreign_out(1)]);
+        let err = classify_parents(&spend, Some(&serialize_hex(&other))).unwrap_err();
+        assert!(err.contains("does not hash to a prevout"), "{err}");
+
+        let missing = classify_parents(&spend, None).unwrap();
+        assert_eq!(missing.fetch, vec![parent.compute_txid()]);
+        assert!(missing.ready.is_empty());
+        let blank = classify_parents(&spend, Some("   ")).unwrap();
+        assert_eq!(blank.fetch, missing.fetch);
+
+        let spend_two = raw_tx(
+            vec![
+                (
+                    OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    Witness::new(),
+                ),
+                (theirs(4), Witness::new()),
+            ],
+            vec![],
+        );
+        let mixed = classify_parents(&spend_two, Some(&parent_hex)).unwrap();
+        assert!(mixed.ready.contains_key(&parent.compute_txid()));
+        assert!(!mixed.fetch.contains(&parent.compute_txid()));
+        assert_eq!(mixed.fetch, vec![theirs(4).txid]);
     }
 
     #[test]
@@ -1412,7 +1541,8 @@ mod tests {
             txid: Txid::from_str(&format!("{:064x}", 0xc0)).unwrap(),
             vout: 2,
             value: 60_000,
-            script_pubkey: derived.address.script_pubkey(),
+            script_pubkey: derived.pay.script().clone(),
+            address: derived.pay.text().to_string(),
             path: derived.path,
             public_key: derived.public_key,
             confirmed: false,
@@ -1430,7 +1560,6 @@ mod tests {
             &book,
             330,
             ScriptKind::Bip84,
-            Network::Bitcoin,
         )
         .unwrap();
         assert_eq!(
@@ -1497,11 +1626,8 @@ mod tests {
     fn bip84_psbt_signs_and_the_witness_verifies() {
         let wallet = wallet(ScriptKind::Bip84);
         let coin = coin_at(&wallet, 0, 50_000);
-        let dest = Address::from_str("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
-            .unwrap()
-            .require_network(Network::Bitcoin)
-            .unwrap();
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = foreign();
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let built = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1531,8 +1657,8 @@ mod tests {
     fn bip86_psbt_signs() {
         let wallet = wallet(ScriptKind::Bip86);
         let coin = coin_at(&wallet, 0, 40_000);
-        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let built = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1552,8 +1678,8 @@ mod tests {
     fn dust_is_rejected_and_a_high_feerate_is_not_a_cap() {
         let wallet = wallet(ScriptKind::Bip84);
         let coin = coin_at(&wallet, 0, 50_000);
-        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let built = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1566,14 +1692,63 @@ mod tests {
         assert!(built.feerate_sat_vb >= 201);
         let err = pay(&wallet, std::slice::from_ref(&coin), &dest, &change, 100, 1).unwrap_err();
         assert!(err.contains("dust"));
+        assert!(err.contains("546"));
+    }
+
+    #[test]
+    fn litecoin_send_rejects_below_2940_and_folds_smaller_change_into_the_fee() {
+        let litecoin =
+            Wallet::open(BIP84_MNEMONIC.into(), Chain::Litecoin, ScriptKind::Bip86, 0).unwrap();
+        let coin = coin_at(&litecoin, 0, 5_000);
+        let dest = litecoin.derive(ChainKind::External, 1).unwrap().pay;
+        let change = litecoin.derive(ChainKind::Change, 0).unwrap().pay;
+        let err = pay(
+            &litecoin,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            2_939,
+            1,
+        )
+        .unwrap_err();
+        assert!(err.contains("2940"), "{err}");
+        let built = pay(
+            &litecoin,
+            std::slice::from_ref(&coin),
+            &dest,
+            &change,
+            2_940,
+            1,
+        )
+        .unwrap();
+        assert_eq!(built.outputs.len(), 1);
+        assert_eq!(built.outputs[0].sats, 2_940);
+        assert_eq!(built.fee_sats, 5_000 - 2_940);
+        assert!(built.fee_sats > built.vsize);
+        let bitcoin = wallet(ScriptKind::Bip84);
+        let bitcoin_coin = coin_at(&bitcoin, 0, 5_000);
+        let bitcoin_dest = bitcoin.derive(ChainKind::External, 1).unwrap().pay;
+        let bitcoin_change = bitcoin.derive(ChainKind::Change, 0).unwrap().pay;
+        let bitcoin_built = pay(
+            &bitcoin,
+            std::slice::from_ref(&bitcoin_coin),
+            &bitcoin_dest,
+            &bitcoin_change,
+            2_000,
+            1,
+        )
+        .unwrap();
+        assert_eq!(bitcoin_built.outputs.len(), 2);
+        let change_sats = bitcoin_built.outputs[1].sats;
+        assert!((546..2_940).contains(&change_sats), "{change_sats}");
     }
 
     #[test]
     fn the_input_cap_runs_before_a_signature_exists() {
         let wallet = wallet(ScriptKind::Bip84);
         let coin = coin_at(&wallet, 0, 50_000);
-        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let mut psbt = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1599,11 +1774,8 @@ mod tests {
     fn sign_psbt_outflow_counts_only_value_leaving_the_wallet() {
         let wallet = wallet(ScriptKind::Bip84);
         let coin = coin_at(&wallet, 0, 50_000);
-        let foreign = Address::from_str("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
-            .unwrap()
-            .require_network(Network::Bitcoin)
-            .unwrap();
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let foreign = foreign();
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let built = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1615,9 +1787,14 @@ mod tests {
         .unwrap();
         let mut owned = BTreeMap::new();
         owned.insert(coin.script_pubkey.clone(), (ChainKind::External, 0));
-        owned.insert(change.script_pubkey(), (ChainKind::Change, 0));
-        let inspection =
-            inspect_psbt(&built.psbt, &owned, ScriptKind::Bip84, Network::Bitcoin).unwrap();
+        owned.insert(change.script().clone(), (ChainKind::Change, 0));
+        let inspection = inspect_psbt(
+            &built.psbt,
+            &owned,
+            ScriptKind::Bip84,
+            Chain::Bitcoin(NetworkKind::Mainnet),
+        )
+        .unwrap();
         assert_eq!(inspection.our_inputs, 1);
         assert_eq!(
             inspection.outflow_sats,
@@ -1633,8 +1810,8 @@ mod tests {
     fn non_committing_sighash_is_rejected_before_a_signature_exists() {
         let segwit = wallet(ScriptKind::Bip84);
         let coin = coin_at(&segwit, 0, 50_000);
-        let dest = segwit.derive(ChainKind::External, 1).unwrap().address;
-        let change = segwit.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = segwit.derive(ChainKind::External, 1).unwrap().pay;
+        let change = segwit.derive(ChainKind::Change, 0).unwrap().pay;
         for sighash in [
             EcdsaSighashType::None,
             EcdsaSighashType::Single,
@@ -1660,8 +1837,8 @@ mod tests {
 
         let tap = wallet(ScriptKind::Bip86);
         let coin = coin_at(&tap, 0, 40_000);
-        let dest = tap.derive(ChainKind::External, 1).unwrap().address;
-        let change = tap.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = tap.derive(ChainKind::External, 1).unwrap().pay;
+        let change = tap.derive(ChainKind::Change, 0).unwrap().pay;
         let mut allowed = pay(&tap, std::slice::from_ref(&coin), &dest, &change, 10_000, 1)
             .unwrap()
             .psbt;
@@ -1683,8 +1860,8 @@ mod tests {
         let wallet = wallet(ScriptKind::Bip84);
         let big = coin_at(&wallet, 0, 150_000);
         let small = coin_at(&wallet, 1, 50_000);
-        let dest = wallet.derive(ChainKind::External, 2).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 2).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let built = pay_capped(
             &wallet,
             &[big, small.clone()],
@@ -1736,8 +1913,8 @@ mod tests {
     fn taproot_key_origins_identify_an_owned_input() {
         let wallet = wallet(ScriptKind::Bip86);
         let coin = coin_at(&wallet, 50, 40_000);
-        let dest = wallet.derive(ChainKind::External, 1).unwrap().address;
-        let change = wallet.derive(ChainKind::Change, 0).unwrap().address;
+        let dest = wallet.derive(ChainKind::External, 1).unwrap().pay;
+        let change = wallet.derive(ChainKind::Change, 0).unwrap().pay;
         let mut psbt = pay(
             &wallet,
             std::slice::from_ref(&coin),
@@ -1755,8 +1932,14 @@ mod tests {
         let mut owned = BTreeMap::new();
         for (chain, index) in indexes {
             let derived = wallet.derive(chain, index).unwrap();
-            owned.insert(derived.address.script_pubkey(), (chain, index));
+            owned.insert(derived.pay.script().clone(), (chain, index));
         }
-        inspect_psbt(&psbt, &owned, ScriptKind::Bip86, Network::Bitcoin).unwrap();
+        inspect_psbt(
+            &psbt,
+            &owned,
+            ScriptKind::Bip86,
+            Chain::Bitcoin(NetworkKind::Mainnet),
+        )
+        .unwrap();
     }
 }

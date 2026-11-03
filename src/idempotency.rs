@@ -1,6 +1,7 @@
+use crate::chain::{Chain, ScriptKind};
 use crate::guard::{SpendKind, SpendRecord};
 use crate::locks::{AllowLocked, InputSet};
-use crate::wallet::{NetworkKind, ScriptKind, Wallet};
+use crate::wallet::Wallet;
 use bitcoin::hashes::Hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -102,7 +103,7 @@ impl From<Slot> for String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalletStamp {
-    pub network: NetworkKind,
+    pub chain: Chain,
     pub script: ScriptKind,
     pub account: u32,
     pub fingerprint: [u8; 4],
@@ -111,7 +112,7 @@ pub struct WalletStamp {
 impl WalletStamp {
     pub fn of(wallet: &Wallet) -> Self {
         Self {
-            network: wallet.network(),
+            chain: wallet.chain(),
             script: wallet.script(),
             account: wallet.account(),
             fingerprint: wallet.fingerprint().to_bytes(),
@@ -119,18 +120,15 @@ impl WalletStamp {
     }
 
     fn prefix(&self, kind: u8) -> Vec<u8> {
-        let network = match self.network {
-            NetworkKind::Mainnet => 0,
-            NetworkKind::Testnet => 1,
-            NetworkKind::Signet => 2,
-            NetworkKind::Regtest => 3,
-        };
-        let script = match self.script {
-            ScriptKind::Bip84 => 84,
-            ScriptKind::Bip86 => 86,
+        let script = match self.chain {
+            Chain::Litecoin => 84,
+            Chain::Bitcoin(_) => match self.script {
+                ScriptKind::Bip84 => 84,
+                ScriptKind::Bip86 => 86,
+            },
         };
         let mut bytes = DOMAIN.to_vec();
-        bytes.extend_from_slice(&[kind, network, script]);
+        bytes.extend_from_slice(&[kind, self.chain.idem_network_byte(), script]);
         bytes.extend_from_slice(&self.account.to_be_bytes());
         bytes.extend_from_slice(&self.fingerprint);
         bytes
@@ -656,7 +654,7 @@ pub fn client_message(decision: &Decision, request_id: &RequestId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::parse_address;
+    use crate::chain::NetworkKind;
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version;
@@ -703,7 +701,7 @@ mod tests {
 
     fn stamp() -> WalletStamp {
         WalletStamp {
-            network: NetworkKind::Mainnet,
+            chain: Chain::Bitcoin(NetworkKind::Mainnet),
             script: ScriptKind::Bip84,
             account: 0,
             fingerprint: [0x73, 0xc5, 0xda, 0x0a],
@@ -715,9 +713,10 @@ mod tests {
     }
 
     fn script_of(address: &str) -> Vec<u8> {
-        parse_address(address, NetworkKind::Mainnet)
+        Chain::Bitcoin(NetworkKind::Mainnet)
+            .parse_pay(address)
             .unwrap()
-            .script_pubkey()
+            .script()
             .to_bytes()
     }
 
@@ -1052,6 +1051,30 @@ mod tests {
         assert_ne!(
             Canon::send(&other_seed, &lower, 25_000, Some(5), None),
             Canon::send(&stamp(), &lower, 25_000, Some(5), None)
+        );
+    }
+
+    #[test]
+    fn litecoin_stamp_uses_network_byte_4() {
+        let litecoin = WalletStamp {
+            chain: Chain::Litecoin,
+            script: ScriptKind::Bip86,
+            ..stamp()
+        };
+        let script = script_of(DEST);
+        let mut bytes = b"satchel.idem.v1\0".to_vec();
+        bytes.extend_from_slice(&[1, 4, 84, 0, 0, 0, 0, 0x73, 0xc5, 0xda, 0x0a]);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 22]);
+        bytes.extend_from_slice(&script);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x61, 0xa8]);
+        bytes.push(0);
+        assert_eq!(
+            Canon::send(&litecoin, &script, 25_000, None, None),
+            Canon(Sha256::digest(&bytes).into())
+        );
+        assert_ne!(
+            Canon::send(&litecoin, &script, 25_000, None, None),
+            Canon::send(&stamp(), &script, 25_000, None, None)
         );
     }
 

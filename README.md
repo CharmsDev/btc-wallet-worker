@@ -2,6 +2,8 @@
 
 Satchel is a small Bitcoin wallet that runs as a Cloudflare Worker. AI agents call it over the Model Context Protocol (MCP) to read a balance and to build, sign, and broadcast transactions. The seed stays in a Worker secret. The worker is the only place that can sign.
 
+A call can set `chain` to `litecoin`. That call uses the same seed on Litecoin mainnet. A call that omits `chain` stays on the configured Bitcoin network.
+
 This repository is public. Do not commit a seed, an extended private key, a bearer token, or an API key.
 
 ## Quickstart
@@ -55,7 +57,8 @@ Vars live in `wrangler.toml`. Secrets are set with `wrangler secret put` and are
 | `MAX_TX_INPUT_SATS` | var | `100000` | Max sum of all input values in one transaction |
 | `AUTO_LOCK_SATS` | var | `330` | Wallet coins at or under this value are locked until `unlock`. `0` locks no coin with a positive value. A value that is not a whole number is a config error |
 | `IDEMPOTENCY_TTL_HOURS` | var | `168` | Hours a `request_id` keeps its signed transaction. Must be 24 to 168. A value outside that range is a config error |
-| `ESPLORA_URLS` | var | empty | Comma-separated Esplora bases. Empty uses the defaults below |
+| `ESPLORA_URLS` | var | empty | Comma-separated Bitcoin Esplora bases. Empty uses the defaults below |
+| `LITECOIN_ESPLORA_URLS` | var | empty | Comma-separated Litecoin Esplora bases. Empty uses `https://litecoinspace.org/api` |
 | `EXPECTED_FINGERPRINT` | var | empty | 8 hex characters. When set, signing is refused if the seed does not match |
 | `ACCESS_TEAM_DOMAIN` | var | empty | Team name or `team.cloudflareaccess.com`. Set with `ACCESS_AUD` |
 | `ACCESS_AUD` | var | empty | Access application AUD tag |
@@ -67,12 +70,15 @@ Account paths:
 
 - BIP84 mainnet is `m/84'/0'/0'`. Testnet, signet, and regtest use coin type `1`.
 - BIP86 mainnet is `m/86'/0'/0'`.
+- Litecoin is `m/84'/2'/0'`. `SCRIPT=bip86` does not change that path.
 
 External chain is `/0/*`. Change is `/1/*`. There is no BIP39 passphrase.
 
 `NETWORK=regtest` has no public default. Set `ESPLORA_URLS` to your own Esplora.
 
 When `ESPLORA_URLS` is empty and `BLOCKSTREAM_API_KEY` is set, mainnet tries `https://enterprise.blockstream.info/api` first, then `https://blockstream.info/api`, then `https://mempool.space/api`. Testnet uses the `/testnet/api` forms, including `https://enterprise.blockstream.info/testnet/api` when a key is set. Signet uses `https://blockstream.info/signet/api` and `https://mempool.space/signet/api`. A custom list replaces those defaults. OAuth is attached only to hosts under `enterprise.blockstream.info`.
+
+Litecoin calls use `LITECOIN_ESPLORA_URLS`. When that var is empty, the only backend is `https://litecoinspace.org/api`. A custom list replaces it. Satchel does not attach the Blockstream OAuth token to those requests, including when a URL host is `enterprise.blockstream.info` and `BLOCKSTREAM_API_KEY` is set.
 
 The key is sent to `https://login.blockstream.com/realms/blockstream-public/protocol/openid-connect/token` with `grant_type=client_credentials` and `scope=openid`. The access token is cached until shortly before `expires_in` and is not logged or returned.
 
@@ -84,9 +90,17 @@ The endpoint is `POST /mcp`. The body is one JSON-RPC 2.0 message. The server is
 
 Tools: `balance`, `address`, `history`, `utxos`, `lock`, `unlock`, `fee_estimates`, `descriptor`, `send`, `sign_psbt`, `sign_tx`, `spend_log`.
 
+Every tool accepts `chain`. Omit it, send a blank string, or send `bitcoin`, and the call uses `NETWORK` and `SCRIPT`. `litecoin` selects Litecoin mainnet. `ltc` is an error. Amounts stay in `sats`. On Litecoin those integers are litoshis.
+
+`balance` and `descriptor` report `network` as `litecoin` and `script` as `bip84` on a Litecoin call. `address` returns `address`, `index`, and `chain`. That `chain` value is `external`, the receive branch. Litecoin receive and change addresses are `ltc1` witness version 0. `send` accepts that form when the program is 20 bytes. Another prefix, an `ltc1p` address, or a legacy base58 address is rejected. Litecoin `send` refuses an amount below 2940 litoshis, and it adds change only when the change is at least 2940. Bitcoin `send` still uses 546. `sign_tx` does not apply that limit. It leaves the outputs you sent.
+
+`utxos` lists `script_type` as `p2wpkh` on Litecoin.
+
+Litecoin scan, locks, idempotency, and the spend log live on the Durable Object named `satchel-ltc`. Bitcoin state stays on `satchel`. Both names use the existing `SPEND_GUARD` binding and the `SpendGuard` class. Litecoin adds no secret and no binding.
+
 `send`, `sign_psbt`, and `sign_tx` default to `broadcast: false`. `send` then returns the fee, vsize, outputs, input sum, and an unsigned PSBT. It signs and broadcasts only when `broadcast` is `true`. `sign_psbt` signs only when every input has a known value and the input sum is within `MAX_TX_INPUT_SATS`. `broadcast: true` on `sign_psbt` also submits the transaction.
 
-`sign_tx` takes a consensus-hex transaction in `tx_hex` and returns the signed hex in `tx_hex`. It signs only the inputs that spend this wallet's outputs. Every other input and every output stay byte for byte as sent, including an `OP_RETURN`. It fetches the transaction behind each input from Esplora to learn the value that input spends, and refuses a fetched transaction that does not hash to its txid. A prevout it cannot fetch is an error, and nothing is signed. `broadcast: true` on `sign_tx` submits the transaction only when every input is signed.
+`sign_tx` takes a consensus-hex transaction in `tx_hex` and returns the signed hex in `tx_hex`. It signs only the inputs that spend this wallet's outputs. Every other input and every output stay byte for byte as sent, including an `OP_RETURN`. Satchel learns each input value from the parent transaction. Omit `parent_tx_hex`, send null, or send a blank string, and every parent is fetched with `GET /tx/{txid}/hex`. A fetched body that does not hash to that txid is an error. Pass one consensus-hex string in `parent_tx_hex` to supply one parent. Its txid must be an input of `tx_hex`. That txid is not fetched. Other inputs are still fetched. A parent that is not hex, that cannot be decoded, or that hashes to none of the inputs refuses the call before a signature. An array is a parse error. A prevout that cannot be resolved is an error, and nothing is signed. `broadcast: true` on `sign_tx` submits the transaction only when every input is signed.
 
 Every call that signs needs a `request_id`. That is `send` with `broadcast: true`, and every `sign_psbt` and `sign_tx` call. A `request_id` is 1 to 80 letters, digits, or `.` `_` `:` `-`. Use a new one for each payment. A dry-run `send` checks the format of a `request_id` and then ignores it.
 
@@ -94,7 +108,7 @@ To retry after an error or a lost reply, send the same arguments with the same `
 
 - `send` counts `to`, `sats`, and `feerate`, plus the set of `inputs` when present. The order of `inputs` does not matter. A `send` without `inputs` is the same request it was before coin control.
 - `sign_psbt` counts the unsigned transaction and `broadcast`, plus `allow_locked` when it is `true`.
-- `sign_tx` counts the exact transaction bytes, `broadcast`, and `allow_locked`. A changed witness is a new request.
+- `sign_tx` counts the exact transaction bytes, `broadcast`, and `allow_locked`. `parent_tx_hex` does not count. A changed witness is a new request.
 
 - The same `request_id` with different arguments is an error.
 - A retry that arrives while the first call is still signing gets an in-progress error. Wait and retry with the same arguments.
@@ -141,7 +155,7 @@ Any other Streamable HTTP client uses the same URL and headers. Missing or wrong
 
 ## Coin control
 
-`utxos` lists each coin with its address, `script_pubkey` in hex, `script_type` (`p2wpkh` or `p2tr`), and `path` (`0/<index>` on the receive chain, `1/<index>` on change). A locked coin has `locked: true` and a `lock_reason` of `manual` or `auto-small`. An unlocked coin has `locked: false` and no `lock_reason`.
+`utxos` lists each coin with its address, `script_pubkey` in hex, `script_type` (`p2wpkh` or `p2tr` on Bitcoin, `p2wpkh` on Litecoin), and `path` (`0/<index>` on the receive chain, `1/<index>` on change). A locked coin has `locked: true` and a `lock_reason` of `manual` or `auto-small`. An unlocked coin has `locked: false` and no `lock_reason`.
 
 - A wallet coin at or under `AUTO_LOCK_SATS` (default 330) is locked until you `unlock` it. Charm-bearing outputs are often this small, and a charm spell itself sits in an `OP_RETURN` of a transaction you build and pass to `sign_tx`. Automatic selection skips the small output so a normal payment does not spend it. `0` locks no coin with a positive value. The threshold is read on every call, so a new value applies to every coin at once.
 - `lock` and `unlock` take `outpoints` as `txid:vout` strings and an optional `note` of up to 200 characters. Calling either twice is the same as calling it once. The last call for an outpoint wins. An outpoint does not need to be a wallet coin. The lock book holds at most 2048 outpoints. A call that would pass that adds none of its outpoints, and rewriting an outpoint already in the book still works.
@@ -166,9 +180,9 @@ The only spend limit is `MAX_TX_INPUT_SATS` (default 100,000). The sum of every 
 
 Locks guard coins against an accidental spend. They are not a spend limit. A caller can pass `allow_locked: true` or list a locked coin in `send` `inputs`. The lock check runs after the input cap and before a signature is created.
 
-`sign_psbt` allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. `sign_tx` writes `SIGHASH_ALL` on segwit inputs and `SIGHASH_DEFAULT` on taproot inputs. Addresses that are not for `NETWORK` are rejected.
+`sign_psbt` allows only `SIGHASH_ALL` for segwit and `SIGHASH_DEFAULT` or `SIGHASH_ALL` for taproot. `sign_tx` writes `SIGHASH_ALL` on segwit inputs and `SIGHASH_DEFAULT` on taproot inputs. Bitcoin addresses that are not for `NETWORK` are rejected. A Litecoin `send` accepts only an `ltc1` witness version 0 address with a 20-byte program.
 
-The Durable Object stores the signed transaction for each `request_id`, so a retry can return it or broadcast it again. It does not approve or refuse an amount. It also stores the lock book under one key. A `lock` or `unlock` loads, edits, and stores that book in one transaction, so two concurrent edits cannot drop each other's marks.
+The Durable Object stores the signed transaction for each `request_id`, so a retry can return it or broadcast it again. It does not approve or refuse an amount. It also stores the lock book under one key. A `lock` or `unlock` loads, edits, and stores that book in one transaction, so two concurrent edits cannot drop each other's marks. A Bitcoin call uses the object named `satchel`. A Litecoin call uses `satchel-ltc`. The keys inside each object stay `scan`, `locks`, `idem`, `idb/{id}`, `spend`, and `oauth`.
 
 The spend log is an append-only note of signed transactions: txid, input sum, destination, fee, time, client name, `request_id`, and kind. It does not store the seed, private keys, bearer tokens, or the Blockstream access token. Rows older than 30 days are dropped, and at most 500 rows are kept. A destination longer than 240 characters is stored shortened. If the note would exceed 1 MiB of JSON, the oldest rows are dropped so the write stays under the Durable Object's 2 MB key-and-value cap. That bound is not a spend limit. The log does not block a second transaction. The row is written in the same Durable Object transaction that stores the signed transaction for the `request_id`, so a retry with the same key does not add a second row. If that transaction fails, nothing is broadcast.
 
@@ -203,4 +217,4 @@ cargo test
 worker-build --release
 ```
 
-`cargo test` covers the BIP84 and BIP86 vectors for the mnemonic `abandon abandon ... about` with an empty passphrase, address network checks, cap accounting, fee checks, a PSBT sign round trip, lock verdicts and refusals, raw transaction signing for P2WPKH and P2TR, pinned idempotency hashes, bearer comparison, Access JWT verification, and MCP JSON-RPC. GitHub Actions runs the same checks and the wasm build. This environment cannot deploy the worker.
+`cargo test` covers the BIP84 and BIP86 vectors for the mnemonic `abandon abandon ... about` with an empty passphrase, the Litecoin `m/84'/2'/0'` receive and change addresses, address network checks, cap accounting, fee checks, a PSBT sign round trip, lock verdicts and refusals, raw transaction signing for P2WPKH and P2TR, a Litecoin P2WPKH `sign_tx` round trip, pinned idempotency hashes, bearer comparison, Access JWT verification, and MCP JSON-RPC. GitHub Actions runs the same checks and the wasm build. This environment cannot deploy the worker.
